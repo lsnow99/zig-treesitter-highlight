@@ -65,7 +65,10 @@
             .url = "git+https://github.com/tree-sitter/zig-tree-sitter#4c5d3a45a9828b8fddd3d59132c4346182fc23b7",
             .hash = "tree_sitter-0.25.0-8heIf4KZAQCmEhQwLPPtKBsU3BBkohvUJpfDXc7vmDM7",
         },
-
+        .tree_sitter_python = .{
+            .url = "git+https://github.com/tree-sitter/tree-sitter-python#293fdc02038ee2bf0e2e206711b69c90ac0d413f",
+            .hash = "N-V-__8AAK21PgAb_K86C9arl06radxCV934N2VALHkf1vDH",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that

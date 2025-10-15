@@ -1,13 +1,12 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+const ts = @import("tree-sitter");
+
+extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
 const Highlight = usize;
 
-const Error = enum {
-    Cancelled,
-    InvalidLanguage,
-    Unknown
-};
+const Error = enum { Cancelled, InvalidLanguage, Unknown };
 
 const HighlightEvent = struct {
     Source: struct {
@@ -16,9 +15,7 @@ const HighlightEvent = struct {
     },
 };
 
-pub fn full() !void {
-    
-}
+pub fn full() !void {}
 
 pub fn countDots(name: []const u8) comptime_int {
     var dots = 0;
@@ -37,7 +34,7 @@ pub fn expandComptime(comptime name: []const u8) [countDots(name) + 1][]const u8
     comptime var result_index = 0;
     comptime var i = 0;
 
-    inline while (i < name.len) : (i += 1){
+    inline while (i < name.len) : (i += 1) {
         const start_index = i;
         inline while (i < name.len) : (i += 1) {
             switch (name[i]) {
@@ -64,20 +61,31 @@ pub fn expand(allocator: std.mem.Allocator, name: []const u8) ![][]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
-// pub fn match(comptime names: []const []const u8, name: []const u8) []type {
-//     comptime var i = 0;
-//     inline while (true) {
-//         const start_index = i;
-//         inline while (i < name.len) : (i += 1) {
-//             switch (name[i]) {
-//                 '.' => break,
-//                 else => {},
-//             }
-//         }
-//         const end_index = i;
-//         const name_slice = name[start_index..end_index];
-//     }
-// }
+pub fn collectNames(allocator: std.mem.Allocator, language: *ts.Language, query_raw: []const u8) ![][]const u8 {
+    var error_offset: u32 = undefined;
+    const query = try ts.Query.create(language, query_raw, &error_offset);
+    const capture_count = query.captureCount();
+
+    var names: std.ArrayList([]const u8) = .{};
+    defer names.deinit(allocator);
+
+    for (0..capture_count) |capture_index| {
+        const maybe_name = query.captureNameForId(@intCast(capture_index));
+        if (maybe_name) |name| {
+            try names.append(allocator, name);
+        }
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+test "basic collectNames" {
+    const allocator = std.testing.allocator;
+    const python_language = tree_sitter_python();
+    defer python_language.destroy();
+    const names = try collectNames(allocator, python_language, @embedFile("python_highlight.scm"));
+    defer allocator.free(names);
+    try std.testing.expect(names.len == 17);
+}
 
 test "basic expandComptime" {
     try std.testing.expect(expandComptime("foo.bar.baz").len == 3);
@@ -102,12 +110,3 @@ test "basic expand" {
     try std.testing.expect(std.mem.eql(u8, bar, "bar"));
     try std.testing.expect(std.mem.eql(u8, baz, "baz"));
 }
-
-// test "basic match" {
-//     const names = .{
-//         "foo.bar.baz",
-//         "foo",
-//     };
-//
-//     try std.testing.expect(match(names, "foo.bar.baz").len == 2);
-// }

@@ -1,5 +1,46 @@
 const std = @import("std");
 
+// builds a tree-sitter grammar implementation as a zig module, and makes it importable by the passed module
+fn buildGrammar(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, grammar_cfg: TreesitterGrammar) void {
+    switch (grammar_cfg) {
+        .C => |c_cfg| {
+            const grammar_dep = b.dependency(c_cfg.dep_name, .{});
+            const grammar_mod = b.addModule(c_cfg.mod_name, .{
+                .target = target,
+                .optimize = optimize,
+            });
+            grammar_mod.addCSourceFiles(.{
+                .root = grammar_dep.path(c_cfg.src_dir),
+                .files = c_cfg.src_files,
+                .flags = c_cfg.flags orelse &.{},
+            });
+            mod.addImport(c_cfg.mod_name, grammar_mod);
+            std.debug.print("Added {s} module\n", .{c_cfg.mod_name});
+        },
+        .CPP => {
+            @panic("CPP not implemented yet");
+        },
+    }
+}
+
+const TreesitterGrammar = union(enum) {
+    C: TreesitterCGrammar,
+    CPP: TreesitterCPPGrammar,
+};
+
+const TreesitterCGrammar = struct {
+    mod_name: []const u8,
+    dep_name: []const u8,
+    src_dir: []const u8 = "src",
+    src_files: []const []const u8 = &.{ "parser.c", "scanner.c" },
+    flags: ?[]const []const u8 = &.{ "-std=c11", "-fPIC", "-Isrc" },
+};
+
+const TreesitterCPPGrammar = struct {
+    // Unimplemented
+};
+
+
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
 // executed by an external runner. The functions in `std.Build` implement a DSL
@@ -46,6 +87,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addImport("tree-sitter", tree_sitter.module("tree_sitter"));
+
+    const grammars = [_]TreesitterGrammar{ TreesitterGrammar{ .C = .{ .mod_name = "tree-sitter-python", .dep_name = "tree_sitter_python" } } };
+    for (grammars) |grammar| {
+        buildGrammar(b, mod, target, optimize, grammar);
+    }
+
 
 
     // Here we define an executable. An executable needs to have a root module
