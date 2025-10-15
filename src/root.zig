@@ -111,15 +111,23 @@ pub fn makeHighlighterEnum(comptime highlight_names: []const [:0]const u8) type 
     });
 }
 
+pub fn getFirstValue(comptime EnumType: type) EnumType {
+    return @enumFromInt(0);
+}
+
 test "makeHighlighterEnum" {
     const highlight_names = &[_][:0]const u8{
-        "Error",
-        "Warning",
-        "Info",
+        "punctuation.special",
+        "keyword",
     };
 
     const HighlightEnum = makeHighlighterEnum(highlight_names);
-    const value: HighlightEnum = .Warning;
+    const value: HighlightEnum = .@"punctuation.special";
+
+    switch (getFirstValue(HighlightEnum)) {
+        .keyword => {},
+        .@"punctuation.special" => {},
+    }
 
     std.debug.print("Enum value = {}\n", .{@intFromEnum(value)});
 }
