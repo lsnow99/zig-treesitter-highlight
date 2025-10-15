@@ -15,7 +15,16 @@ const HighlightEvent = struct {
     },
 };
 
-pub fn full() !void {}
+pub fn full() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    const python_language = tree_sitter_python();
+    defer python_language.destroy();
+    const names = try collectNames(allocator, python_language, @embedFile("python_highlight.scm"));
+    defer allocator.free(names);
+    try std.testing.expect(names.len == 17);
+    std.debug.print("{any}\n", .{names});
+}
 
 pub fn countDots(name: []const u8) comptime_int {
     var dots = 0;
@@ -76,6 +85,43 @@ pub fn collectNames(allocator: std.mem.Allocator, language: *ts.Language, query_
         }
     }
     return names.toOwnedSlice(allocator);
+}
+
+// pub fn match(highlight_names: [][]const u8, captured_name: []const u8) ![]const u8{
+//     
+// }
+
+pub fn makeHighlighterEnum(comptime highlight_names: []const [:0]const u8) type {
+    var fields: [highlight_names.len]std.builtin.Type.EnumField = undefined;
+
+    for (highlight_names, 0..) |name, i| {
+        fields[i] = .{
+            .name = name,
+            .value = i,
+        };
+    }
+
+    return @Type(.{
+        .@"enum" = .{
+            .tag_type = u32,
+            .fields = &fields,
+            .decls = &.{},
+            .is_exhaustive = true,
+        },
+    });
+}
+
+test "makeHighlighterEnum" {
+    const highlight_names = &[_][:0]const u8{
+        "Error",
+        "Warning",
+        "Info",
+    };
+
+    const HighlightEnum = makeHighlighterEnum(highlight_names);
+    const value: HighlightEnum = .Warning;
+
+    std.debug.print("Enum value = {}\n", .{@intFromEnum(value)});
 }
 
 test "basic collectNames" {
