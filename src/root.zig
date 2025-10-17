@@ -87,9 +87,55 @@ pub fn collectNames(allocator: std.mem.Allocator, language: *ts.Language, query_
     return names.toOwnedSlice(allocator);
 }
 
-// pub fn match(highlight_names: [][]const u8, captured_name: []const u8) ![]const u8{
-//     
-// }
+pub fn comptimeNameLookup(comptime T: type) std.EnumMap(T, []const []const u8) {
+    comptime {
+        switch (@typeInfo(T)) {
+            .@"enum" => |enumInfo| {
+                var field_list: [enumInfo.fields.len]struct{ []const u8, []const [] const u8} = undefined;
+                var i = 0;
+                var map = std.EnumMap(T, []const []const u8).init(.{});
+                for (enumInfo.fields) |field| {
+                    field_list[i] = .{ field.name, &expandComptime(field.name)};
+                    i += 1;
+                    map.put(@enumFromInt(field.value), &expandComptime(field.name));
+                }
+                return map;
+            },
+            else => @compileError("T must be an enum"),
+        }
+    }
+}
+
+
+// Finds the best match for a captured name among a list of recognized names.
+// Expands the recognized names (split on '.') and finds the recognized name
+// that has the most number of parts that are present in the captured name.
+// All parts of the recognized name must be present in the captured name.
+pub fn match(comptime T: type, captured_name: []const u8) ?T {
+    var table = comptime comptimeNameLookup(T);
+    var iter = table.iterator();
+
+    var best_match: ?T = null;
+    var best_matches: u8 = 0;
+    while (iter.next()) |entry| {
+        var part_matches: u8 = 0;
+        const value = table.get(entry.key) orelse unreachable;
+        for (value) |part| {
+            if (std.mem.eql(u8, captured_name, part)) {
+                part_matches += 1;
+            } else {
+                part_matches = 0;
+                break;
+            }
+        }
+        if (best_matches < part_matches) {
+            best_matches = part_matches;
+            best_match = entry.key;
+        }
+    }
+
+    return best_match;
+}
 
 pub fn makeHighlighterEnum(comptime highlight_names: []const [:0]const u8) type {
     var fields: [highlight_names.len]std.builtin.Type.EnumField = undefined;
@@ -130,6 +176,18 @@ test "makeHighlighterEnum" {
     }
 
     std.debug.print("Enum value = {}\n", .{@intFromEnum(value)});
+
+    const res = match(HighlightEnum, "keyword");
+    if (res) |r| {
+        switch (r) {
+            .keyword => {
+                std.debug.print("Matched keyword\n", .{});
+            },
+            .@"punctuation.special" => {
+                std.debug.print("matched punctuation", .{});
+            },
+        }
+    }
 }
 
 test "basic collectNames" {
