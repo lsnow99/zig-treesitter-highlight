@@ -1,0 +1,6 @@
+keyword
+punctuation.special
+function
+function.builtin
+variable
+variable.builtin
