@@ -6,7 +6,7 @@ extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
 const Error = enum { Cancelled, InvalidLanguage, Unknown };
 
-const stdNames = expandComptime(@embedFile("standard_names.txt"), '.');
+const stdNames = expandComptime(@embedFile("standard_names.txt"), '\n');
 
 pub fn full() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -69,26 +69,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
     };
 }
 
-pub fn min(a: comptime_int, b: comptime_int) comptime_int {
-    return if (a < b) a else b;
-}
-
-pub fn countSequence(haystack: []const u8, needle: u8, start: comptime_int, step: comptime_int) comptime_int {
-    var i = start;
-    var count = 0;
-    inline while (i < haystack.len and i >= 0) : (i += step) {
-        switch (haystack[i]) {
-            needle => {
-                count += 1;
-            },
-            else => {
-                break;
-            },
-        }
-    }
-    return count;
-}
-
 pub fn countChars(name: []const u8, needle: u8) comptime_int {
     var chars = 0;
     for (name) |char| {
@@ -100,43 +80,9 @@ pub fn countChars(name: []const u8, needle: u8) comptime_int {
     return chars;
 }
 
-pub fn trimInner(haystack: []const u8, needle: u8, start: comptime_int, step: comptime_int) [haystack.len - countSequence(haystack, needle, start, step)]u8 {
-    comptime var result: [haystack.len - countSequence(haystack, needle, start, step)][]const u8 = undefined;
-
-    comptime var i = start;
-
-    inline while (i < haystack.len and i >= 0) : (i += step) {
-        switch (haystack[i]) {
-            needle => {},
-            else => {
-                break;
-            },
-        }
-    }
-
-    comptime var j = i;
-    inline while (j < haystack.len and j >= 0) : (j += step) {
-        @compileLog(j);
-        result[j - i] = haystack[j];
-    }
-    return result;
-}
-
-pub fn trimStart(haystack: []const u8, needle: u8) [haystack.len - countSequence(haystack, needle, 0, 1)]u8 {
-    return trimInner(haystack, needle, 0, 1);
-}
-
-pub fn trimEnd(haystack: []const u8, needle: u8) [haystack.len - countSequence(haystack, needle, haystack.len, -1)]u8 {
-    return trimInner(haystack, needle, haystack.len, -1);
-}
-
-pub fn trim(haystack: []const u8, needle: u8) [trimEnd(trimStart(haystack, needle), needle).len]u8 {
-    return trimEnd(trimStart(haystack, needle), needle);
-}
-
-pub fn expandComptime(comptime name: []const u8, comptime char: u8) [countChars(trim(name, char), char)][]const u8 {
-    comptime var trimmed = trim(name, char);
-    comptime var result: [countChars(trimmed)][]const u8 = undefined;
+pub fn expandComptime(comptime name: []const u8, comptime char: u8) [countChars(std.mem.trim(u8, name, &[_]u8{char}), char) + 1][]const u8 {
+    comptime var trimmed = std.mem.trim(u8, name, &[_]u8{char});
+    comptime var result: [countChars(trimmed, char) + 1][]const u8 = undefined;
 
     comptime var result_index = 0;
     comptime var i = 0;
