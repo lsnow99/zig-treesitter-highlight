@@ -4,3 +4,6 @@ function
 function.builtin
 variable
 variable.builtin
+constructor
+constant
+function.method

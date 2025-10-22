@@ -4,9 +4,10 @@ const ts = @import("tree-sitter");
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
-const Error = enum { Cancelled, InvalidLanguage, Unknown };
+const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQuery };
 
-const stdNames = expandComptime(@embedFile("standard_names.txt"), '\n');
+const std_names = expandComptime(@embedFile("standard_names.txt"), '\n');
+const python_highlight = @embedFile("python_highlight.scm");
 
 pub fn full() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -16,15 +17,17 @@ pub fn full() !void {
     const names = try collectNames(allocator, python_language, @embedFile("python_highlight.scm"));
     defer allocator.free(names);
 
-    std.debug.print("Names: {s}\n", .{try std.mem.join(allocator, ", ", &stdNames)});
+    std.debug.print("Names: {s}\n", .{try std.mem.join(allocator, ", ", &std_names)});
 
-    const HighlightT = createHighlighterEnum(&stdNames);
+    const HighlightT = createHighlighterEnum(&std_names);
     const highlighterConfig = createHighlighterConfig(HighlightT);
-    var highlighter = highlighterConfig.create(python_language);
+    var highlighter = try highlighterConfig.create(allocator, python_language, python_highlight);
     defer highlighter.destroy();
 
-    const events = highlighter.highlight(@embedFile("simple_python.py"));
-    for (events) |event| {
+    var iter = try highlighter.highlight(@embedFile("simple_python.py"));
+    defer iter.destroy();
+
+    while (iter.next()) |event| {
         switch (event) {
             .Source => |source| {
                 std.debug.print("Source: {d}-{d}\n", .{ source.start, source.end });
@@ -39,6 +42,55 @@ pub fn full() !void {
     }
 }
 
+pub fn Queue(comptime Child: type) type {
+    return struct {
+        const Self = @This();
+        const QueueNode = struct {
+            data: Child,
+            next: ?*QueueNode,
+        };
+        allocator: std.mem.Allocator,
+        start: ?*QueueNode,
+        end: ?*QueueNode,
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return Self{
+                .allocator = allocator,
+                .start = null,
+                .end = null,
+            };
+        }
+        pub fn peek(self: *Self) ?Child {
+            return if (self.start) |start| start.data else null;
+        }
+        pub fn enqueue(self: *Self, value: Child) !void {
+            const node = try self.allocator.create(QueueNode);
+            node.* = .{ .data = value, .next = null };
+            if (self.end) |end| end.next = node //
+            else self.start = node;
+            self.end = node;
+        }
+        pub fn dequeue(self: *Self) ?Child {
+            const start = self.start orelse return null;
+            defer self.allocator.destroy(start);
+            if (start.next) |next|
+                self.start = next
+            else {
+                self.start = null;
+                self.end = null;
+            }
+            return start.data;
+        }
+        pub fn destroy(self: *Self) void {
+            var next: ?*QueueNode = self.start;
+            while (next) |node| {
+                next = node.next;
+                self.allocator.destroy(node);
+            }
+        }
+    };
+}
+
 pub fn createHighlighterConfig(HighlightT: type) type {
     const HighlightEvent = union(enum) {
         Source: struct {
@@ -50,26 +102,145 @@ pub fn createHighlighterConfig(HighlightT: type) type {
     };
 
     return struct {
-        language: *ts.Language,
+        // Improve: can't use Self twice
+        const HighlighterSelf = @This();
 
-        pub fn create(language: *ts.Language) @This() {
-            return @This(){ .language = language };
+        const HighlightEventIterator = struct {
+            const Self = @This();
+
+            tree: *ts.Tree,
+            source: []const u8,
+            highlighter: HighlighterSelf,
+            captures: Queue(struct { u32, ts.Query.Match }), // (pattern_index, ts.Query.Match),
+            highlight_last_byte_stack: std.ArrayList(u64) = .{},
+            offset: u64 = 0,
+            last_highlight_range: ?ts.Range = null,
+
+            pub fn next(self: *Self) ?HighlightEvent {
+                while (true) {
+                    if (self.captures.peek() == null) {
+                        if (self.highlight_last_byte_stack.pop()) |_| {
+                            return HighlightEvent{
+                                .HighlightEnd = {},
+                            };
+                        }
+                        self.offset = self.source.len;
+                        return null;
+                    }
+                    const capture_info = self.captures.peek() orelse unreachable;
+                    var match = capture_info[1];
+                    var capture = match.captures[capture_info[0]];
+                    const range = capture.node.range();
+
+                    self.offset = range.start_byte;
+
+                    if (self.highlight_last_byte_stack.items.len > 0) {
+                        const last_highlight_end_byte = self.highlight_last_byte_stack.getLast();
+                        if (last_highlight_end_byte >= range.start_byte) {
+                            return HighlightEvent{
+                                .HighlightEnd = {},
+                            };
+                        }
+                    }
+
+                    _ = self.captures.dequeue();
+
+                    if (self.last_highlight_range) |last_highlight_range| {
+                        if (range.start_byte == last_highlight_range.start_byte and range.end_byte == last_highlight_range.end_byte) {
+                            continue;
+                        }
+                    }
+
+                    while (self.captures.peek()) |next_capture_info| {
+                        const next_match = next_capture_info[1];
+                        const next_capture = next_match.captures[next_capture_info[0]];
+                        if (next_capture.node.eql(capture.node)) {
+                            _ = self.captures.dequeue();
+
+                            capture = next_capture;
+                            match = next_match;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // Unreachable because every possible capture should have been collected and added to the capture_map in `create`
+                    const current_highlight = self.highlighter.capture_map.get(capture.index) orelse unreachable;
+
+                    self.last_highlight_range = range;
+                    self.highlight_last_byte_stack.append(self.highlighter.allocator, range.end_byte) catch unreachable;
+
+                    return HighlightEvent{
+                        .HighlightStart = current_highlight,
+                    };
+                }
+            }
+
+            pub fn destroy(self: *Self) void {
+                self.tree.destroy();
+                self.captures.destroy();
+                self.highlight_last_byte_stack.deinit(self.highlighter.allocator);
+            }
+        };
+
+        allocator: std.mem.Allocator,
+        language: *ts.Language,
+        parser: *ts.Parser,
+        cursor: *ts.QueryCursor,
+        query: *ts.Query,
+        capture_map: std.AutoHashMap(usize, HighlightT),
+
+        pub fn create(allocator: std.mem.Allocator, language: *ts.Language, query_scm: []const u8) !HighlighterSelf {
+            const parser = ts.Parser.create();
+            var error_offset: u32 = 0;
+            // Improve: surface error information
+            const query = ts.Query.create(language, query_scm, &error_offset) catch return Error.InvalidQuery;
+            try parser.setLanguage(language);
+
+            // build map of captureId (index in collectNames) -> best match of HighlightT
+            var capture_map = std.AutoHashMap(usize, HighlightT).init(allocator);
+            const names = try collectNames(allocator, language, query_scm);
+            defer allocator.free(names);
+            for (names, 0..) |name, i| {
+                const best_highlight = matchName(HighlightT, name);
+                if (best_highlight == null) {
+                    // IMPROVE: surface error information
+                    std.debug.panic("unmatched name: {s}", .{name});
+                }
+                try capture_map.put(i, best_highlight orelse unreachable);
+            }
+
+            return HighlighterSelf{ .allocator = allocator, .language = language, .parser = parser, .cursor = ts.QueryCursor.create(), .query = query, .capture_map = capture_map };
         }
 
-        pub fn highlight(self: @This(), source: []const u8) []const HighlightEvent {
-            _ = self;
-            _ = source;
-            return &[_]HighlightEvent{};
+        pub fn highlight(self: HighlighterSelf, source: []const u8) !HighlightEventIterator {
+            // IMPROVE: support cancellation and properly handle different encodings
+            const tree = self.parser.parseString(source, null) orelse return Error.ParseFailure;
+            self.cursor.exec(self.query, tree.rootNode());
+            var captures = Queue(struct { u32, ts.Query.Match }).init(self.allocator);
+            while (self.cursor.nextCapture()) |capture| {
+                try captures.enqueue(capture);
+            }
+            return HighlightEventIterator{
+                .tree = tree,
+                .source = source,
+                .highlighter = self,
+                .captures = captures,
+            };
         }
 
         // Note: does not destroy the language
-        pub fn destroy(self: *@This()) void {
-            _ = self;
+        pub fn destroy(self: *HighlighterSelf) void {
+            self.parser.destroy();
+            self.cursor.destroy();
+            self.query.destroy();
+            self.capture_map.deinit();
         }
     };
 }
 
 pub fn countChars(name: []const u8, needle: u8) comptime_int {
+    @setEvalBranchQuota(name.len * 1000);
     var chars = 0;
     for (name) |char| {
         switch (char) {
@@ -154,7 +325,7 @@ pub fn comptimeNameLookup(comptime T: type) std.EnumMap(T, []const []const u8) {
 // Expands the recognized names (split on '.') and finds the recognized name
 // that has the most number of parts that are present in the captured name.
 // All parts of the recognized name must be present in the captured name.
-pub fn match(comptime T: type, captured_name: []const u8) ?T {
+pub fn matchName(comptime T: type, captured_name: []const u8) ?T {
     var table = comptime comptimeNameLookup(T);
     var iter = table.iterator();
 
@@ -220,7 +391,7 @@ test "createHighlighterEnum" {
 
     std.debug.print("Enum value = {}\n", .{@intFromEnum(value)});
 
-    const res = match(HighlightEnum, "keyword");
+    const res = matchName(HighlightEnum, "keyword");
     if (res) |r| {
         switch (r) {
             .keyword => {
