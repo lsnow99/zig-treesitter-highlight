@@ -24,13 +24,14 @@ pub fn full() !void {
     var highlighter = try highlighterConfig.create(allocator, python_language, python_highlight);
     defer highlighter.destroy();
 
-    var iter = try highlighter.highlight(@embedFile("simple_python.py"));
+    const test_text = @embedFile("simple_python.py");
+    var iter = try highlighter.highlight(test_text);
     defer iter.destroy();
 
-    while (iter.next()) |event| {
+    while (try iter.next()) |event| {
         switch (event) {
             .Source => |source| {
-                std.debug.print("Source: {d}-{d}\n", .{ source.start, source.end });
+                std.debug.print("Source: {d}-{d}:{s}\n", .{ source.start, source.end, test_text[source.start..source.end] });
             },
             .HighlightStart => |highlight| {
                 std.debug.print("HighlightStart: {any}\n", .{highlight});
@@ -115,9 +116,41 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             highlight_last_byte_stack: std.ArrayList(u64) = .{},
             offset: u64 = 0,
             last_highlight_range: ?ts.Range = null,
+            next_event: ?HighlightEvent = null,
 
-            pub fn next(self: *Self) ?HighlightEvent {
+            pub fn emitEvent(self: *Self, offset: u64, event: ?HighlightEvent) ?HighlightEvent {
+                if (self.offset < offset) {
+                    self.next_event = event;
+                    defer self.offset = offset;
+                    return HighlightEvent{
+                        .Source = .{
+                            .start = self.offset,
+                            .end = offset,
+                        },
+                    };
+                }
+                return event;
+            }
+
+            pub fn next(self: *Self) !?HighlightEvent {
                 while (true) {
+                    if (self.next_event) |event| {
+                        self.next_event = null;
+                        return event;
+                    }
+
+                    // if (self.captures.peek() == null) {
+                    //     if (self.offset < self.source.len) {
+                    //         defer self.offset = self.source.len;
+                    //         return HighlightEvent{ .Source = .{
+                    //             .start = self.offset,
+                    //             .end = self.source.len,
+                    //         } };
+                    //     } else {
+                    //         return null;
+                    //     }
+                    // }
+
                     if (self.captures.peek() == null) {
                         if (self.highlight_last_byte_stack.pop()) |_| {
                             return HighlightEvent{
@@ -132,14 +165,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     var capture = match.captures[capture_info[0]];
                     const range = capture.node.range();
 
-                    self.offset = range.start_byte;
-
                     if (self.highlight_last_byte_stack.items.len > 0) {
                         const last_highlight_end_byte = self.highlight_last_byte_stack.getLast();
-                        if (last_highlight_end_byte >= range.start_byte) {
-                            return HighlightEvent{
+                        if (last_highlight_end_byte <= range.start_byte) {
+                            return self.emitEvent(last_highlight_end_byte, HighlightEvent{
                                 .HighlightEnd = {},
-                            };
+                            });
                         }
                     }
 
@@ -168,11 +199,11 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     const current_highlight = self.highlighter.capture_map.get(capture.index) orelse unreachable;
 
                     self.last_highlight_range = range;
-                    self.highlight_last_byte_stack.append(self.highlighter.allocator, range.end_byte) catch unreachable;
+                    try self.highlight_last_byte_stack.append(self.highlighter.allocator, range.end_byte);
 
-                    return HighlightEvent{
+                    return self.emitEvent(range.start_byte, HighlightEvent{
                         .HighlightStart = current_highlight,
-                    };
+                    });
                 }
             }
 
@@ -207,6 +238,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     // IMPROVE: surface error information
                     std.debug.panic("unmatched name: {s}", .{name});
                 }
+                // Unreachable because we check for null above
                 try capture_map.put(i, best_highlight orelse unreachable);
             }
 
@@ -335,10 +367,14 @@ pub fn matchName(comptime T: type, captured_name: []const u8) ?T {
         var part_matches: u8 = 0;
         const value = table.get(entry.key) orelse unreachable;
         for (value) |part| {
-            if (std.mem.eql(u8, captured_name, part)) {
-                part_matches += 1;
-            } else {
-                part_matches = 0;
+            var expanded = std.mem.splitScalar(u8, captured_name, '.');
+            const found = while (expanded.next()) |expanded_part| {
+                if (std.mem.eql(u8, expanded_part, part)) {
+                    part_matches += 1;
+                    break true;
+                }
+            } else false;
+            if (!found) {
                 break;
             }
         }
@@ -404,6 +440,11 @@ test "createHighlighterEnum" {
     }
 }
 
+test "basic matchName" {
+    const HighlightEnum = createHighlighterEnum(&std_names);
+    try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
+}
+
 test "basic collectNames" {
     const allocator = std.testing.allocator;
     const python_language = tree_sitter_python();
@@ -428,8 +469,8 @@ test "expandComptime with line break" {
 }
 
 test "expandComptime with line break from embedded file" {
-    try std.testing.expect(countChars(@embedFile("standard_names.txt"), '\n') == 6);
-    try std.testing.expect(expandComptime(@embedFile("standard_names.txt"), '\n').len == 6);
+    try std.testing.expect(countChars(@embedFile("standard_names.txt"), '\n') == 17);
+    try std.testing.expect(expandComptime(@embedFile("standard_names.txt"), '\n').len == 17);
 }
 
 test "basic expand" {

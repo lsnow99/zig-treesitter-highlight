@@ -7,3 +7,11 @@ variable.builtin
 constructor
 constant
 function.method
+property
+type
+number
+comment
+string
+escape
+embedded
+operator
