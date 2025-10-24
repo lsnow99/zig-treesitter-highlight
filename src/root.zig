@@ -29,6 +29,7 @@ pub fn full() !void {
     defer iter.destroy();
 
     while (try iter.next()) |event| {
+        std.debug.print("event: {any}\n", .{iter});
         switch (event) {
             .Source => |source| {
                 std.debug.print("Source: {d}-{d}:{s}\n", .{ source.start, source.end, test_text[source.start..source.end] });
@@ -53,6 +54,7 @@ pub fn Queue(comptime Child: type) type {
         allocator: std.mem.Allocator,
         start: ?*QueueNode,
         end: ?*QueueNode,
+        len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return Self{
@@ -67,9 +69,10 @@ pub fn Queue(comptime Child: type) type {
         pub fn enqueue(self: *Self, value: Child) !void {
             const node = try self.allocator.create(QueueNode);
             node.* = .{ .data = value, .next = null };
-            if (self.end) |end| end.next = node //
+            if (self.end) |end| end.next = node
             else self.start = node;
             self.end = node;
+            self.len += 1;
         }
         pub fn dequeue(self: *Self) ?Child {
             const start = self.start orelse return null;
@@ -80,6 +83,7 @@ pub fn Queue(comptime Child: type) type {
                 self.start = null;
                 self.end = null;
             }
+            self.len -= 1;
             return start.data;
         }
         pub fn destroy(self: *Self) void {
@@ -132,8 +136,15 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 return event;
             }
 
+            pub fn printState(self: *Self) void {
+                std.debug.print("offset: {d}, last_highlight_range: {any}, next_event: {any}, captures.len: {d}\n", .{ self.offset, self.last_highlight_range, self.next_event, self.captures.len });
+            }
+
             pub fn next(self: *Self) !?HighlightEvent {
                 while (true) {
+                    std.debug.print("in loop: ", .{});
+                    self.printState();
+
                     if (self.next_event) |event| {
                         self.next_event = null;
                         return event;
@@ -178,6 +189,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                     if (self.last_highlight_range) |last_highlight_range| {
                         if (range.start_byte == last_highlight_range.start_byte and range.end_byte == last_highlight_range.end_byte) {
+                            std.debug.print("skipping\n", .{});
                             continue;
                         }
                     }
@@ -185,8 +197,10 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     while (self.captures.peek()) |next_capture_info| {
                         const next_match = next_capture_info[1];
                         const next_capture = next_match.captures[next_capture_info[0]];
+                        std.debug.print("next_capture.node.start_byte: {d}, capture.node.start_byte: {d}\n", .{ next_capture.node.startByte(), capture.node.startByte() });
                         if (next_capture.node.eql(capture.node)) {
                             _ = self.captures.dequeue();
+                            std.debug.print("dequeue\n", .{});
 
                             capture = next_capture;
                             match = next_match;
