@@ -93,7 +93,29 @@ pub fn Queue(comptime Child: type) type {
                 self.allocator.destroy(node);
             }
         }
+        pub fn print(self: *Self) void {
+            var next: ?*QueueNode = self.start;
+            while (next) |node| {
+                std.debug.print("Node: {any}\n", .{node});
+                next = node.next;
+            }
+        }
     };
+}
+
+test "queue" {
+    var queue = Queue(u32).init(std.testing.allocator);
+    defer queue.destroy();
+    try queue.enqueue(1);
+    try queue.enqueue(2);
+    try queue.enqueue(3);
+    try std.testing.expect(queue.peek() == 1);
+    try std.testing.expect(queue.dequeue() == 1);
+    try std.testing.expect(queue.peek() == 2);
+    try std.testing.expect(queue.dequeue() == 2);
+    try std.testing.expect(queue.peek() == 3);
+    try std.testing.expect(queue.dequeue() == 3);
+    try std.testing.expect(queue.peek() == null);
 }
 
 pub fn createHighlighterConfig(HighlightT: type) type {
@@ -175,6 +197,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     var match = capture_info[1];
                     var capture = match.captures[capture_info[0]];
                     const range = capture.node.range();
+                    std.debug.print("range: {any}\n", .{range});
 
                     if (self.highlight_last_byte_stack.items.len > 0) {
                         const last_highlight_end_byte = self.highlight_last_byte_stack.getLast();
@@ -197,7 +220,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     while (self.captures.peek()) |next_capture_info| {
                         const next_match = next_capture_info[1];
                         const next_capture = next_match.captures[next_capture_info[0]];
-                        std.debug.print("next_capture.node.start_byte: {d}, capture.node.start_byte: {d}\n", .{ next_capture.node.startByte(), capture.node.startByte() });
+                        std.debug.print("next_capture.node.start_byte: {d}, capture.node.start_byte: {d}, capture: {any}\n", .{ next_capture.node.startByte(), capture.node.startByte(), next_capture_info });
                         if (next_capture.node.eql(capture.node)) {
                             _ = self.captures.dequeue();
                             std.debug.print("dequeue\n", .{});
@@ -264,9 +287,18 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             const tree = self.parser.parseString(source, null) orelse return Error.ParseFailure;
             self.cursor.exec(self.query, tree.rootNode());
             var captures = Queue(struct { u32, ts.Query.Match }).init(self.allocator);
+            var i: usize = 0;
             while (self.cursor.nextCapture()) |capture| {
+                const match = capture[1];
+                const capture_1 = match.captures[capture[0]];
+                std.debug.print("capture: {any}, i: {d}\n", .{capture_1.node.range(), i});
+                std.debug.print("{any}\n", .{capture});
                 try captures.enqueue(capture);
+                i += 1;
             }
+            const capture = captures.peek() orelse return Error.ParseFailure;
+            std.debug.print("peek: {any}\n", .{capture});
+            captures.print();
             return HighlightEventIterator{
                 .tree = tree,
                 .source = source,
