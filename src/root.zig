@@ -6,8 +6,46 @@ extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
 const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQuery };
 
-const std_names = expandComptime(@embedFile("standard_names.txt"), '\n');
+const std_lines = splitComptime(@embedFile("standard_names.txt"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
+
+
+pub fn parseNameMap(contents: []const u8) type {
+    const lines = splitComptime(contents, '\n');
+    comptime var names: [lines.len][]const u8 = undefined;
+    comptime var pairs: [lines.len]struct { []const u8, []const u8 } = undefined;
+
+    var i: comptime_int = 0;
+    while (i < lines.len) : (i += 1) {
+        const lineSplit = splitComptime(lines[i], ',');
+        names[i] = lineSplit[0];
+        pairs[i] = .{ lineSplit[0], lineSplit[1] };
+    }
+
+    const HighlightTLocal = createHighlighterEnum(&names);
+    var base_map = std.StaticStringMap([]const u8).initComptime(pairs);
+
+    const map = comptime blk: {
+        var map = std.EnumMap(HighlightTLocal, []const u8).init(.{});
+        switch(@typeInfo(HighlightTLocal)) {
+            .@"enum" => |enumInfo| {
+                for (enumInfo.fields) |field| {
+                    map.put(@enumFromInt(field.value), base_map.get(field.name) orelse unreachable);
+                }
+                break :blk map;
+            },
+            else => @compileError("T must be an enum"),
+        }
+    };
+
+    return struct {
+        const HighlightT = HighlightTLocal;
+        var style_map = map;
+    };
+}
+
+const std_name_map = parseNameMap(@embedFile("standard_names.txt"));
+const std_names = std_name_map.style_map.keys();
 
 pub fn full() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -17,31 +55,34 @@ pub fn full() !void {
     const names = try collectNames(allocator, python_language, @embedFile("python_highlight.scm"));
     defer allocator.free(names);
 
-    std.debug.print("Names: {s}\n", .{try std.mem.join(allocator, ", ", &std_names)});
-
-    const HighlightT = createHighlighterEnum(&std_names);
+    const HighlightT = std_name_map.HighlightT;
     const highlighterConfig = createHighlighterConfig(HighlightT);
     var highlighter = try highlighterConfig.create(allocator, python_language, python_highlight);
     defer highlighter.destroy();
 
-    const test_text = @embedFile("simple_python.py");
+    const test_text = @embedFile("generated_5mb.py");
     var iter = try highlighter.highlight(test_text);
     defer iter.destroy();
 
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+
     while (try iter.next()) |event| {
-        std.debug.print("event: {any}\n", .{iter});
         switch (event) {
             .Source => |source| {
-                std.debug.print("Source: {d}-{d}:{s}\n", .{ source.start, source.end, test_text[source.start..source.end] });
+                try out.appendSlice(allocator, test_text[source.start..source.end]);
             },
             .HighlightStart => |highlight| {
-                std.debug.print("HighlightStart: {any}\n", .{highlight});
+                try out.appendSlice(allocator, "<span class=\"");
+                try out.appendSlice(allocator, std_name_map.style_map.get(highlight) orelse unreachable);
+                try out.appendSlice(allocator, "\">");
             },
             .HighlightEnd => {
-                std.debug.print("HighlightEnd\n", .{});
+                try out.appendSlice(allocator, "</span>");
             },
         }
     }
+
 }
 
 pub fn Queue(comptime Child: type) type {
@@ -69,8 +110,7 @@ pub fn Queue(comptime Child: type) type {
         pub fn enqueue(self: *Self, value: Child) !void {
             const node = try self.allocator.create(QueueNode);
             node.* = .{ .data = value, .next = null };
-            if (self.end) |end| end.next = node
-            else self.start = node;
+            if (self.end) |end| end.next = node else self.start = node;
             self.end = node;
             self.len += 1;
         }
@@ -91,13 +131,6 @@ pub fn Queue(comptime Child: type) type {
             while (next) |node| {
                 next = node.next;
                 self.allocator.destroy(node);
-            }
-        }
-        pub fn print(self: *Self) void {
-            var next: ?*QueueNode = self.start;
-            while (next) |node| {
-                std.debug.print("Node: {any}\n", .{node});
-                next = node.next;
             }
         }
     };
@@ -138,7 +171,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             tree: *ts.Tree,
             source: []const u8,
             highlighter: HighlighterSelf,
-            captures: Queue(struct { u32, ts.Query.Match }), // (pattern_index, ts.Query.Match),
+            captures: Queue(ts.Query.Capture), // (capture_index, ts.Query.Match),
             highlight_last_byte_stack: std.ArrayList(u64) = .{},
             offset: u64 = 0,
             last_highlight_range: ?ts.Range = null,
@@ -164,25 +197,10 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
             pub fn next(self: *Self) !?HighlightEvent {
                 while (true) {
-                    std.debug.print("in loop: ", .{});
-                    self.printState();
-
                     if (self.next_event) |event| {
                         self.next_event = null;
                         return event;
                     }
-
-                    // if (self.captures.peek() == null) {
-                    //     if (self.offset < self.source.len) {
-                    //         defer self.offset = self.source.len;
-                    //         return HighlightEvent{ .Source = .{
-                    //             .start = self.offset,
-                    //             .end = self.source.len,
-                    //         } };
-                    //     } else {
-                    //         return null;
-                    //     }
-                    // }
 
                     if (self.captures.peek() == null) {
                         if (self.highlight_last_byte_stack.pop()) |_| {
@@ -193,15 +211,13 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                         self.offset = self.source.len;
                         return null;
                     }
-                    const capture_info = self.captures.peek() orelse unreachable;
-                    var match = capture_info[1];
-                    var capture = match.captures[capture_info[0]];
+                    var capture = self.captures.peek() orelse unreachable;
                     const range = capture.node.range();
-                    std.debug.print("range: {any}\n", .{range});
 
                     if (self.highlight_last_byte_stack.items.len > 0) {
                         const last_highlight_end_byte = self.highlight_last_byte_stack.getLast();
                         if (last_highlight_end_byte <= range.start_byte) {
+                            _ = self.highlight_last_byte_stack.pop();
                             return self.emitEvent(last_highlight_end_byte, HighlightEvent{
                                 .HighlightEnd = {},
                             });
@@ -212,21 +228,15 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                     if (self.last_highlight_range) |last_highlight_range| {
                         if (range.start_byte == last_highlight_range.start_byte and range.end_byte == last_highlight_range.end_byte) {
-                            std.debug.print("skipping\n", .{});
                             continue;
                         }
                     }
 
-                    while (self.captures.peek()) |next_capture_info| {
-                        const next_match = next_capture_info[1];
-                        const next_capture = next_match.captures[next_capture_info[0]];
-                        std.debug.print("next_capture.node.start_byte: {d}, capture.node.start_byte: {d}, capture: {any}\n", .{ next_capture.node.startByte(), capture.node.startByte(), next_capture_info });
+                    while (self.captures.peek()) |next_capture| {
                         if (next_capture.node.eql(capture.node)) {
                             _ = self.captures.dequeue();
-                            std.debug.print("dequeue\n", .{});
 
                             capture = next_capture;
-                            match = next_match;
                         } else {
                             break;
                         }
@@ -286,19 +296,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             // IMPROVE: support cancellation and properly handle different encodings
             const tree = self.parser.parseString(source, null) orelse return Error.ParseFailure;
             self.cursor.exec(self.query, tree.rootNode());
-            var captures = Queue(struct { u32, ts.Query.Match }).init(self.allocator);
-            var i: usize = 0;
-            while (self.cursor.nextCapture()) |capture| {
-                const match = capture[1];
-                const capture_1 = match.captures[capture[0]];
-                std.debug.print("capture: {any}, i: {d}\n", .{capture_1.node.range(), i});
-                std.debug.print("{any}\n", .{capture});
+            var captures = Queue(ts.Query.Capture).init(self.allocator);
+            while (self.cursor.nextCapture()) |match_info| {
+                const match = match_info[1];
+                const capture = match.captures[match_info[0]];
                 try captures.enqueue(capture);
-                i += 1;
             }
-            const capture = captures.peek() orelse return Error.ParseFailure;
-            std.debug.print("peek: {any}\n", .{capture});
-            captures.print();
             return HighlightEventIterator{
                 .tree = tree,
                 .source = source,
@@ -329,7 +332,7 @@ pub fn countChars(name: []const u8, needle: u8) comptime_int {
     return chars;
 }
 
-pub fn expandComptime(comptime name: []const u8, comptime char: u8) [countChars(std.mem.trim(u8, name, &[_]u8{char}), char) + 1][]const u8 {
+pub fn splitComptime(comptime name: []const u8, comptime char: u8) [countChars(std.mem.trim(u8, name, &[_]u8{char}), char) + 1][]const u8 {
     comptime var trimmed = std.mem.trim(u8, name, &[_]u8{char});
     comptime var result: [countChars(trimmed, char) + 1][]const u8 = undefined;
 
@@ -388,9 +391,9 @@ pub fn comptimeNameLookup(comptime T: type) std.EnumMap(T, []const []const u8) {
                 var i = 0;
                 var map = std.EnumMap(T, []const []const u8).init(.{});
                 for (enumInfo.fields) |field| {
-                    field_list[i] = .{ field.name, &expandComptime(field.name, '.') };
+                    field_list[i] = .{ field.name, &splitComptime(field.name, '.') };
                     i += 1;
-                    map.put(@enumFromInt(field.value), &expandComptime(field.name, '.'));
+                    map.put(@enumFromInt(field.value), &splitComptime(field.name, '.'));
                 }
                 return map;
             },
@@ -487,7 +490,7 @@ test "createHighlighterEnum" {
 }
 
 test "basic matchName" {
-    const HighlightEnum = createHighlighterEnum(&std_names);
+    const HighlightEnum = createHighlighterEnum(std_names);
     try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
 }
 
@@ -500,23 +503,23 @@ test "basic collectNames" {
     try std.testing.expect(names.len == 17);
 }
 
-test "basic expandComptime" {
-    try std.testing.expect(expandComptime("foo.bar.baz", '.').len == 3);
-    try std.testing.expect(std.mem.eql(u8, expandComptime("foo.bar.baz", '.')[0], "foo"));
-    try std.testing.expect(std.mem.eql(u8, expandComptime("foo.bar.baz", '.')[1], "bar"));
-    try std.testing.expect(std.mem.eql(u8, expandComptime("foo.bar.baz", '.')[2], "baz"));
+test "basic splitComptime" {
+    try std.testing.expect(splitComptime("foo.bar.baz", '.').len == 3);
+    try std.testing.expect(std.mem.eql(u8, splitComptime("foo.bar.baz", '.')[0], "foo"));
+    try std.testing.expect(std.mem.eql(u8, splitComptime("foo.bar.baz", '.')[1], "bar"));
+    try std.testing.expect(std.mem.eql(u8, splitComptime("foo.bar.baz", '.')[2], "baz"));
 }
 
-test "expandComptime with line break" {
-    try std.testing.expect(expandComptime("a\nb\nc", '\n').len == 3);
-    try std.testing.expect(std.mem.eql(u8, expandComptime("a\nb\nc", '\n')[0], "a"));
-    try std.testing.expect(std.mem.eql(u8, expandComptime("a\nb\nc", '\n')[1], "b"));
-    try std.testing.expect(std.mem.eql(u8, expandComptime("a\nb.\nc", '\n')[2], "c"));
+test "splitComptime with line break" {
+    try std.testing.expect(splitComptime("a\nb\nc", '\n').len == 3);
+    try std.testing.expect(std.mem.eql(u8, splitComptime("a\nb\nc", '\n')[0], "a"));
+    try std.testing.expect(std.mem.eql(u8, splitComptime("a\nb\nc", '\n')[1], "b"));
+    try std.testing.expect(std.mem.eql(u8, splitComptime("a\nb.\nc", '\n')[2], "c"));
 }
 
-test "expandComptime with line break from embedded file" {
+test "splitComptime with line break from embedded file" {
     try std.testing.expect(countChars(@embedFile("standard_names.txt"), '\n') == 17);
-    try std.testing.expect(expandComptime(@embedFile("standard_names.txt"), '\n').len == 17);
+    try std.testing.expect(splitComptime(@embedFile("standard_names.txt"), '\n').len == 17);
 }
 
 test "basic expand" {
