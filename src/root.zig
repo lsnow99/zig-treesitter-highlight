@@ -9,7 +9,6 @@ const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQ
 const std_lines = splitComptime(@embedFile("standard_names.txt"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
 
-
 pub fn parseNameMap(contents: []const u8) type {
     const lines = splitComptime(contents, '\n');
     comptime var names: [lines.len][]const u8 = undefined;
@@ -27,7 +26,7 @@ pub fn parseNameMap(contents: []const u8) type {
 
     const map = comptime blk: {
         var map = std.EnumMap(HighlightTLocal, []const u8).init(.{});
-        switch(@typeInfo(HighlightTLocal)) {
+        switch (@typeInfo(HighlightTLocal)) {
             .@"enum" => |enumInfo| {
                 for (enumInfo.fields) |field| {
                     map.put(@enumFromInt(field.value), base_map.get(field.name) orelse unreachable);
@@ -44,11 +43,62 @@ pub fn parseNameMap(contents: []const u8) type {
     };
 }
 
+const RendererOpts = struct {
+    base_tree: ?*ts.Tree = null,
+};
+
+pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype, style_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
+    var iter = try highlighter.highlight(source, opts.base_tree);
+    defer iter.destroy();
+    while (try iter.next()) |event| {
+        switch (event) {
+            .Source => |range| {
+                try out.print("{s}", .{source[range.start..range.end]});
+            },
+            .HighlightStart => |highlight_val| {
+                try out.print("<span style=\"{s}\">", .{style_map.get(highlight_val) orelse unreachable});
+            },
+            .HighlightEnd => {
+                try out.print("</span>", .{});
+            },
+        }
+    }
+    try out.flush();
+}
+
+pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: anytype, style_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
+    try out.print("<ul>", .{});
+    var iter = try highlighter.highlightLines(source, opts.base_tree);
+    defer iter.destroy();
+    while (try iter.next()) |event| {
+        switch (event) {
+            .Source => |range| {
+                try out.print("{s}", .{source[range.start..range.end]});
+            },
+            .HighlightStart => |highlight_val| {
+                try out.print("<span style=\"{s}\">", .{style_map.get(highlight_val) orelse unreachable});
+            },
+            .HighlightEnd => {
+                try out.print("</span>", .{});
+            },
+            .LineStart => {
+                try out.print("<li>", .{});
+            },
+            .LineEnd => {
+                try out.print("</li>", .{});
+            },
+        }
+    }
+    try out.print("</ul>", .{});
+    try out.flush();
+}
+
 const std_name_map = parseNameMap(@embedFile("standard_names.txt"));
 const std_names = std_name_map.style_map.keys();
 
 pub fn full() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
     const python_language = tree_sitter_python();
     defer python_language.destroy();
@@ -60,29 +110,15 @@ pub fn full() !void {
     var highlighter = try highlighterConfig.create(allocator, python_language, python_highlight);
     defer highlighter.destroy();
 
-    const test_text = @embedFile("generated_5mb.py");
-    var iter = try highlighter.highlight(test_text);
+    const test_text = @embedFile("simple_python.py");
+    var iter = try highlighter.highlight(test_text, null);
     defer iter.destroy();
 
-    var out: std.ArrayList(u8) = .{};
-    defer out.deinit(allocator);
+    var buf: [1024]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    const out = &writer.interface;
 
-    while (try iter.next()) |event| {
-        switch (event) {
-            .Source => |source| {
-                try out.appendSlice(allocator, test_text[source.start..source.end]);
-            },
-            .HighlightStart => |highlight| {
-                try out.appendSlice(allocator, "<span class=\"");
-                try out.appendSlice(allocator, std_name_map.style_map.get(highlight) orelse unreachable);
-                try out.appendSlice(allocator, "\">");
-            },
-            .HighlightEnd => {
-                try out.appendSlice(allocator, "</span>");
-            },
-        }
-    }
-
+    try renderHTMLLines(test_text, out, highlighter, std_name_map.style_map, .{});
 }
 
 pub fn Queue(comptime Child: type) type {
@@ -92,14 +128,26 @@ pub fn Queue(comptime Child: type) type {
             data: Child,
             next: ?*QueueNode,
         };
-        allocator: std.mem.Allocator,
+        const Iterator = struct {
+            cur: ?*QueueNode,
+
+            pub fn next(self: *@This()) ?Child {
+                if (self.cur) |cur| {
+                    self.cur = cur.next;
+                    return cur.data;
+                }
+                return null;
+            }
+        };
+
+        arena: std.heap.ArenaAllocator,
         start: ?*QueueNode,
         end: ?*QueueNode,
         len: usize = 0,
 
         pub fn init(allocator: std.mem.Allocator) Self {
             return Self{
-                .allocator = allocator,
+                .arena = std.heap.ArenaAllocator.init(allocator),
                 .start = null,
                 .end = null,
             };
@@ -108,7 +156,7 @@ pub fn Queue(comptime Child: type) type {
             return if (self.start) |start| start.data else null;
         }
         pub fn enqueue(self: *Self, value: Child) !void {
-            const node = try self.allocator.create(QueueNode);
+            const node = try self.arena.allocator().create(QueueNode);
             node.* = .{ .data = value, .next = null };
             if (self.end) |end| end.next = node else self.start = node;
             self.end = node;
@@ -116,7 +164,7 @@ pub fn Queue(comptime Child: type) type {
         }
         pub fn dequeue(self: *Self) ?Child {
             const start = self.start orelse return null;
-            defer self.allocator.destroy(start);
+            defer self.arena.allocator().destroy(start);
             if (start.next) |next|
                 self.start = next
             else {
@@ -126,12 +174,21 @@ pub fn Queue(comptime Child: type) type {
             self.len -= 1;
             return start.data;
         }
+        // Destroys the queue. Future calls to queue methods are undefined after destroy()
         pub fn destroy(self: *Self) void {
-            var next: ?*QueueNode = self.start;
-            while (next) |node| {
-                next = node.next;
-                self.allocator.destroy(node);
-            }
+            self.arena.deinit();
+        }
+        // Clears the queue but does not destroy the backing allocator
+        pub fn clear(self: *Self, mode: ?std.heap.ArenaAllocator.ResetMode) void {
+            self.allocator.reset(mode orelse .free_all);
+            self.start = null;
+            self.end = null;
+            self.len = 0;
+        }
+        pub fn iter(self: *Self) Iterator {
+            return Iterator{
+                .cur = self.start,
+            };
         }
     };
 }
@@ -151,6 +208,11 @@ test "queue" {
     try std.testing.expect(queue.peek() == null);
 }
 
+const HighlightTree = union(enum) {
+    Owned: *ts.Tree,
+    Borrowed: *ts.Tree,
+};
+
 pub fn createHighlighterConfig(HighlightT: type) type {
     const HighlightEvent = union(enum) {
         Source: struct {
@@ -161,14 +223,26 @@ pub fn createHighlighterConfig(HighlightT: type) type {
         HighlightEnd: void,
     };
 
+    const HighlightLineEvent = union(enum) {
+        Source: struct {
+            start: usize,
+            end: usize,
+        },
+        HighlightStart: HighlightT,
+        HighlightEnd: void,
+        LineStart: void,
+        LineEnd: void,
+    };
+
     return struct {
         // Improve: can't use Self twice
         const HighlighterSelf = @This();
+        const InternalHighlightT = HighlightT;
 
         const HighlightEventIterator = struct {
             const Self = @This();
 
-            tree: *ts.Tree,
+            tree: HighlightTree,
             source: []const u8,
             highlighter: HighlighterSelf,
             captures: Queue(ts.Query.Capture), // (capture_index, ts.Query.Match),
@@ -176,6 +250,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             offset: u64 = 0,
             last_highlight_range: ?ts.Range = null,
             next_event: ?HighlightEvent = null,
+            managing_tree: bool = true,
 
             pub fn emitEvent(self: *Self, offset: u64, event: ?HighlightEvent) ?HighlightEvent {
                 if (self.offset < offset) {
@@ -255,9 +330,88 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             }
 
             pub fn destroy(self: *Self) void {
-                self.tree.destroy();
+                switch (self.tree) {
+                    .Owned => |t| t.destroy(),
+                    .Borrowed => {},
+                }
                 self.captures.destroy();
                 self.highlight_last_byte_stack.deinit(self.highlighter.allocator);
+            }
+        };
+
+        const HighlightLineIterator = struct {
+            const Self = @This();
+
+            base_iterator: HighlightEventIterator,
+            highlight_stack: std.ArrayList(HighlightT),
+            event_queue: Queue(HighlightLineEvent),
+            initial_line_started: bool = false,
+            last_event_was_line_end: bool = false,
+
+            pub fn next(self: *Self) !?HighlightLineEvent {
+                while (self.event_queue.dequeue()) |event| {
+                    return event;
+                }
+                if (try self.base_iterator.next()) |event| {
+                    if (!self.initial_line_started) {
+                        self.initial_line_started = true;
+                        return HighlightLineEvent{ .LineStart = {} };
+                    }
+
+                    switch (event) {
+                        .HighlightStart => |highlight_val| {
+                            try self.highlight_stack.append(self.base_iterator.highlighter.allocator, highlight_val);
+                            return HighlightLineEvent{ .HighlightStart = highlight_val };
+                        },
+                        .HighlightEnd => {
+                            _ = self.highlight_stack.pop();
+                            return HighlightLineEvent{ .HighlightEnd = {} };
+                        },
+                        .Source => |range| {
+                            var sliced = self.base_iterator.source[range.start..range.end];
+                            var offset: usize = 0;
+                            var start: usize = 0;
+
+                            self.last_event_was_line_end = false;
+
+                            // IMPROVE: carriage returns?
+                            while (std.mem.indexOfScalar(u8, sliced, '\n')) |i| {
+                                try self.event_queue.enqueue(HighlightLineEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
+
+                                start = i + 1;
+                                offset += start;
+                                sliced = sliced[start..];
+
+                                for (self.highlight_stack.items) |_| {
+                                    try self.event_queue.enqueue(HighlightLineEvent{ .HighlightEnd = {} });
+                                }
+                                try self.event_queue.enqueue(HighlightLineEvent{ .LineEnd = {} });
+
+                                if (sliced.len == 0) {
+                                    self.last_event_was_line_end = true;
+                                    break;
+                                }
+
+                                for (self.highlight_stack.items) |highlight_val| {
+                                    try self.event_queue.enqueue(HighlightLineEvent{ .HighlightStart = highlight_val });
+                                }
+                            }
+                        },
+                    }
+                }
+
+                if (self.initial_line_started and !self.last_event_was_line_end) {
+                    self.last_event_was_line_end = true;
+                    return HighlightLineEvent{ .LineEnd = {} };
+                }
+
+                return null;
+            }
+
+            pub fn destroy(self: *Self) void {
+                self.base_iterator.destroy();
+                self.highlight_stack.deinit(self.base_iterator.highlighter.allocator);
+                self.event_queue.destroy();
             }
         };
 
@@ -292,10 +446,16 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             return HighlighterSelf{ .allocator = allocator, .language = language, .parser = parser, .cursor = ts.QueryCursor.create(), .query = query, .capture_map = capture_map };
         }
 
-        pub fn highlight(self: HighlighterSelf, source: []const u8) !HighlightEventIterator {
+        pub fn parseSource(self: HighlighterSelf, source: []const u8) !HighlightTree {
             // IMPROVE: support cancellation and properly handle different encodings
-            const tree = self.parser.parseString(source, null) orelse return Error.ParseFailure;
-            self.cursor.exec(self.query, tree.rootNode());
+            return HighlightTree{ .Owned = self.parser.parseString(source, null) orelse return error.ParseFailure };
+        }
+
+        pub fn highlight(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightEventIterator {
+            const tagged_tree = if (tree) |t| HighlightTree{ .Borrowed = t } else try self.parseSource(source);
+            self.cursor.exec(self.query, switch (tagged_tree) {
+                inline else => |t| t.rootNode(),
+            });
             var captures = Queue(ts.Query.Capture).init(self.allocator);
             while (self.cursor.nextCapture()) |match_info| {
                 const match = match_info[1];
@@ -303,10 +463,18 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 try captures.enqueue(capture);
             }
             return HighlightEventIterator{
-                .tree = tree,
+                .tree = tagged_tree,
                 .source = source,
                 .highlighter = self,
                 .captures = captures,
+            };
+        }
+
+        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightLineIterator {
+            return HighlightLineIterator{
+                .base_iterator = try self.highlight(source, tree),
+                .highlight_stack = .{},
+                .event_queue = Queue(HighlightLineEvent).init(self.allocator),
             };
         }
 
