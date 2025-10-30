@@ -6,8 +6,10 @@ extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
 const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQuery };
 
-const std_lines = splitComptime(@embedFile("standard_names.txt"), '\n');
+const std_lines = splitComptime(@embedFile("standard_names"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
+
+const std_names = [_][]const u8{"function.method", ""};
 
 pub fn parseNameMap(contents: []const u8) type {
     const lines = splitComptime(contents, '\n');
@@ -38,8 +40,8 @@ pub fn parseNameMap(contents: []const u8) type {
     };
 
     return struct {
-        const HighlightT = HighlightTLocal;
-        var style_map = map;
+        pub const HighlightT = HighlightTLocal;
+        pub var style_map = map;
     };
 }
 
@@ -93,33 +95,7 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
     try out.flush();
 }
 
-const std_name_map = parseNameMap(@embedFile("standard_names.txt"));
-const std_names = std_name_map.style_map.keys();
-
-pub fn full() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
-    const allocator = gpa.allocator();
-    const python_language = tree_sitter_python();
-    defer python_language.destroy();
-    const names = try collectNames(allocator, python_language, @embedFile("python_highlight.scm"));
-    defer allocator.free(names);
-
-    const HighlightT = std_name_map.HighlightT;
-    const highlighterConfig = createHighlighterConfig(HighlightT);
-    var highlighter = try highlighterConfig.create(allocator, python_language, python_highlight);
-    defer highlighter.destroy();
-
-    const test_text = @embedFile("simple_python.py");
-    var iter = try highlighter.highlight(test_text, null);
-    defer iter.destroy();
-
-    var buf: [1024]u8 = undefined;
-    var writer = std.fs.File.stdout().writer(&buf);
-    const out = &writer.interface;
-
-    try renderHTMLLines(test_text, out, highlighter, std_name_map.style_map, .{});
-}
+pub const std_name_map = parseNameMap(@embedFile("standard_names"));
 
 pub fn Queue(comptime Child: type) type {
     return struct {
@@ -213,21 +189,20 @@ const HighlightTree = union(enum) {
     Borrowed: *ts.Tree,
 };
 
+const HighlightRange = struct {
+    start: usize,
+    end: usize,
+};
+
 pub fn createHighlighterConfig(HighlightT: type) type {
     const HighlightEvent = union(enum) {
-        Source: struct {
-            start: usize,
-            end: usize,
-        },
+        Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
     };
 
-    const HighlightLineEvent = union(enum) {
-        Source: struct {
-            start: usize,
-            end: usize,
-        },
+    const HighlightDelimitedEvent = union(enum) {
+        Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
         LineStart: void,
@@ -250,18 +225,18 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             offset: u64 = 0,
             last_highlight_range: ?ts.Range = null,
             next_event: ?HighlightEvent = null,
-            managing_tree: bool = true,
 
             pub fn emitEvent(self: *Self, offset: u64, event: ?HighlightEvent) ?HighlightEvent {
                 if (self.offset < offset) {
                     self.next_event = event;
-                    defer self.offset = offset;
-                    return HighlightEvent{
+                    const evt = HighlightEvent{
                         .Source = .{
                             .start = self.offset,
                             .end = offset,
                         },
                     };
+                    self.offset = offset;
+                    return evt;
                 }
                 return event;
             }
@@ -278,13 +253,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     }
 
                     if (self.captures.peek() == null) {
-                        if (self.highlight_last_byte_stack.pop()) |_| {
-                            return HighlightEvent{
+                        if (self.highlight_last_byte_stack.pop()) |end_byte| {
+                            return self.emitEvent(end_byte, HighlightEvent{
                                 .HighlightEnd = {},
-                            };
+                            });
                         }
-                        self.offset = self.source.len;
-                        return null;
+                        return self.emitEvent(self.source.len, null);
                     }
                     var capture = self.captures.peek() orelse unreachable;
                     const range = capture.node.range();
@@ -339,70 +313,100 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             }
         };
 
-        const HighlightLineIterator = struct {
+        const HighlightDelimitedIterator = struct {
             const Self = @This();
 
+            delimiter: u8,
             base_iterator: HighlightEventIterator,
             highlight_stack: std.ArrayList(HighlightT),
-            event_queue: Queue(HighlightLineEvent),
+            event_queue: Queue(HighlightDelimitedEvent),
             initial_line_started: bool = false,
             last_event_was_line_end: bool = false,
 
-            pub fn next(self: *Self) !?HighlightLineEvent {
+            pub fn transformEvent(evt: HighlightEvent) HighlightDelimitedEvent {
+                switch (evt) {
+                    .HighlightStart => {
+                        return HighlightDelimitedEvent{ .HighlightStart = evt.HighlightStart };
+                    },
+                    .HighlightEnd => {
+                        return HighlightDelimitedEvent{ .HighlightEnd = {} };
+                    },
+                    .Source => |range| {
+                        return HighlightDelimitedEvent{ .Source = .{ .start = range.start, .end = range.end } };
+                    },
+                }
+            }
+
+            pub fn handleSource(self: *Self, range: HighlightRange) !HighlightDelimitedEvent {
+                const raw_sliced = self.base_iterator.source[range.start..range.end];
+                var sliced = raw_sliced;
+                var offset: usize = 0;
+                var start: usize = 0;
+
+                self.last_event_was_line_end = false;
+
+                // IMPROVE: carriage returns?
+                while (std.mem.indexOfScalar(u8, sliced, self.delimiter)) |i| {
+                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
+
+                    start += i + 1;
+                    offset += start;
+                    sliced = raw_sliced[start..];
+
+                    for (self.highlight_stack.items) |_| {
+                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightEnd = {} });
+                    }
+                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineEnd = {} });
+
+                    if (sliced.len == 0) {
+                        self.last_event_was_line_end = true;
+                        break;
+                    }
+
+                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineStart = {} });
+
+                    for (self.highlight_stack.items) |highlight_val| {
+                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
+                    }
+                }
+
+                return HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.end } };
+            }
+
+            pub fn next(self: *Self) !?HighlightDelimitedEvent {
                 while (self.event_queue.dequeue()) |event| {
                     return event;
                 }
                 if (try self.base_iterator.next()) |event| {
                     if (!self.initial_line_started) {
                         self.initial_line_started = true;
-                        return HighlightLineEvent{ .LineStart = {} };
+                        switch (event) {
+                            .Source => |range| {
+                                try self.event_queue.enqueue(try self.handleSource(range));
+                            },
+                            else => try self.event_queue.enqueue(HighlightDelimitedIterator.transformEvent(event)),
+                        }
+                        return HighlightDelimitedEvent{ .LineStart = {} };
                     }
 
                     switch (event) {
                         .HighlightStart => |highlight_val| {
                             try self.highlight_stack.append(self.base_iterator.highlighter.allocator, highlight_val);
-                            return HighlightLineEvent{ .HighlightStart = highlight_val };
+                            return HighlightDelimitedEvent{ .HighlightStart = highlight_val };
                         },
                         .HighlightEnd => {
                             _ = self.highlight_stack.pop();
-                            return HighlightLineEvent{ .HighlightEnd = {} };
+                            return HighlightDelimitedEvent{ .HighlightEnd = {} };
                         },
                         .Source => |range| {
-                            var sliced = self.base_iterator.source[range.start..range.end];
-                            var offset: usize = 0;
-                            var start: usize = 0;
-
-                            self.last_event_was_line_end = false;
-
-                            // IMPROVE: carriage returns?
-                            while (std.mem.indexOfScalar(u8, sliced, '\n')) |i| {
-                                try self.event_queue.enqueue(HighlightLineEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
-
-                                start = i + 1;
-                                offset += start;
-                                sliced = sliced[start..];
-
-                                for (self.highlight_stack.items) |_| {
-                                    try self.event_queue.enqueue(HighlightLineEvent{ .HighlightEnd = {} });
-                                }
-                                try self.event_queue.enqueue(HighlightLineEvent{ .LineEnd = {} });
-
-                                if (sliced.len == 0) {
-                                    self.last_event_was_line_end = true;
-                                    break;
-                                }
-
-                                for (self.highlight_stack.items) |highlight_val| {
-                                    try self.event_queue.enqueue(HighlightLineEvent{ .HighlightStart = highlight_val });
-                                }
-                            }
+                            return try self.handleSource(range);
                         },
                     }
                 }
 
                 if (self.initial_line_started and !self.last_event_was_line_end) {
                     self.last_event_was_line_end = true;
-                    return HighlightLineEvent{ .LineEnd = {} };
+                    return HighlightDelimitedEvent{ .LineEnd = {} };
                 }
 
                 return null;
@@ -470,11 +474,16 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             };
         }
 
-        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightLineIterator {
-            return HighlightLineIterator{
+        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightDelimitedIterator {
+            return self.highlightDelimited(source, tree, '\n');
+        }
+
+        pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator {
+            return HighlightDelimitedIterator{
                 .base_iterator = try self.highlight(source, tree),
                 .highlight_stack = .{},
-                .event_queue = Queue(HighlightLineEvent).init(self.allocator),
+                .event_queue = Queue(HighlightDelimitedEvent).init(self.allocator),
+                .delimiter = delimiter,
             };
         }
 
@@ -658,7 +667,7 @@ test "createHighlighterEnum" {
 }
 
 test "basic matchName" {
-    const HighlightEnum = createHighlighterEnum(std_names);
+    const HighlightEnum = createHighlighterEnum(&std_names);
     try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
 }
 
@@ -686,8 +695,8 @@ test "splitComptime with line break" {
 }
 
 test "splitComptime with line break from embedded file" {
-    try std.testing.expect(countChars(@embedFile("standard_names.txt"), '\n') == 17);
-    try std.testing.expect(splitComptime(@embedFile("standard_names.txt"), '\n').len == 17);
+    try std.testing.expect(countChars(@embedFile("standard_names"), '\n') == 17);
+    try std.testing.expect(splitComptime(@embedFile("standard_names"), '\n').len == 17);
 }
 
 test "basic expand" {
