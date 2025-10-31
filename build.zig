@@ -5,23 +5,27 @@ fn buildGrammar(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolve
     switch (grammar_cfg) {
         .C => |c_cfg| {
             const grammar_dep = b.dependency(c_cfg.dep_name, .{});
-            const grammar_mod = b.addModule(c_cfg.mod_name, .{
-                .target = target,
-                .optimize = optimize,
+            const grammar_lib = b.addLibrary(.{
+                .name = c_cfg.mod_name,
+                .root_module = b.createModule(.{
+                    .target = target,
+                    .optimize = optimize,
+                }),
             });
-            grammar_mod.addCSourceFiles(.{
+            grammar_lib.addCSourceFiles(.{
                 .root = grammar_dep.path(c_cfg.src_dir),
                 .files = c_cfg.src_files,
                 .flags = c_cfg.flags orelse &.{},
             });
-            mod.addImport(c_cfg.mod_name, grammar_mod);
-            std.debug.print("Added {s} module\n", .{c_cfg.mod_name});
+            grammar_lib.linkLibC();
+            mod.linkLibrary(grammar_lib);
         },
         .CPP => {
             @panic("CPP not implemented yet");
         },
     }
 }
+
 
 const TreesitterGrammar = union(enum) {
     C: TreesitterCGrammar,
@@ -88,13 +92,6 @@ pub fn build(b: *std.Build) void {
     });
     mod.addImport("tree-sitter", tree_sitter.module("tree_sitter"));
 
-    const grammars = [_]TreesitterGrammar{ TreesitterGrammar{ .C = .{ .mod_name = "tree-sitter-python", .dep_name = "tree_sitter_python" } } };
-    for (grammars) |grammar| {
-        buildGrammar(b, mod, target, optimize, grammar);
-    }
-
-
-
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -140,6 +137,11 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("tree-sitter", tree_sitter.module("tree_sitter"));
 
+    const grammars = [_]TreesitterGrammar{ TreesitterGrammar{ .C = .{ .mod_name = "tree-sitter-python", .dep_name = "tree_sitter_python" } } };
+    for (grammars) |grammar| {
+        buildGrammar(b, exe.root_module, target, optimize, grammar);
+    }
+
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
     // step). By default the install prefix is `zig-out/` but can be overridden
@@ -178,6 +180,10 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+
+    for (grammars) |grammar| {
+        buildGrammar(b, mod_tests.root_module, target, optimize, grammar);
+    }
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);
