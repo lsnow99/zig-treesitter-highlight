@@ -9,7 +9,98 @@ const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQ
 const std_lines = splitComptime(@embedFile("standard_names"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
 
-const std_names = [_][]const u8{"function.method", ""};
+const std_names = [_][]const u8{ "function.method", "" };
+
+pub fn filterNonNullComptime(T: type, values: []const ?T) []const T {
+    var filtered: []const T = &[_]T{};
+    for (values) |value| {
+        if (value) |v| {
+            filtered = filtered ++ &[_]T{v};
+        }
+    }
+    return filtered;
+}
+
+pub fn itemType(T: type) type {
+    switch (@typeInfo(T)) {
+        .pointer => |pointer| {
+            return pointer.child;
+        },
+        else => @compileError("T must be a pointer"),
+    }
+}
+
+pub fn collectUniqueComptime(T: type, values: []const T) []const T {
+    var unique: []const T = &[_]T{};
+    for (values) |value| {
+        comptime outer: {
+            for (unique) |unique_value| {
+                if (std.mem.eql(itemType(T), value, unique_value)) {
+                    break :outer;
+                }
+            }
+            unique = unique ++ &[_]T{value};
+        }
+    }
+    return unique;
+}
+
+pub fn buildTerminalStyleMap(HighlightT: type, color_map: std.EnumMap(HighlightT, []const u8)) std.EnumMap(HighlightT, []const u8) {
+    var colors: [color_map.count()]?[]const u8 = [_]?[]const u8{null} ** color_map.count();
+
+    comptime var i: comptime_int = 0;
+
+    inline while (i < color_map.count()) : (i += 1) {
+        colors[i] = color_map.get(@enumFromInt(i)) orelse unreachable;
+    }
+
+    const filtered = filterNonNullComptime([]const u8, &colors);
+    const unique = collectUniqueComptime([]const u8, filtered);
+
+    const ColorT = comptime createEnum(unique);
+
+    const code_map = comptime blk: {
+        var map = std.EnumMap(ColorT, []const u8).init(.{});
+        switch (@typeInfo(ColorT)) {
+            .@"enum" => |enumInfo| {
+                for (enumInfo.fields) |field| {
+                    const colorEnum: ColorT = @enumFromInt(field.value);
+                    const code = switch (colorEnum) {
+                        // .red => "31",
+                        .green => "32",
+                        .yellow => "33",
+                        .blue => "34",
+                        .purple => "35",
+                        .cyan => "36",
+                        // IMPROVE: should we return null instead?
+                        .none => "37",
+                        .white => "37",
+                    };
+                    map.put(colorEnum, code);
+                }
+                break :blk map;
+            },
+            else => @compileError("unexpected ColorT not an enum"),
+        }
+    };
+
+    const highlight_map = comptime blk: {
+        var map = std.EnumMap(HighlightT, []const u8).init(.{});
+        switch (@typeInfo(HighlightT)) {
+            .@"enum" => |enumInfo| {
+                for (enumInfo.fields) |field| {
+                    const highlightEnum: HighlightT = @enumFromInt(field.value);
+                    const colorEnum = std.meta.stringToEnum(ColorT, color_map.get(highlightEnum) orelse unreachable) orelse unreachable;
+                    map.put(highlightEnum, code_map.get(colorEnum) orelse unreachable);
+                }
+                break :blk map;
+            },
+            else => @compileError("unexpected HighlightT not an enum"),
+        }
+    };
+
+    return highlight_map;
+}
 
 pub fn parseNameMap(contents: []const u8) type {
     const lines = splitComptime(contents, '\n');
@@ -23,10 +114,10 @@ pub fn parseNameMap(contents: []const u8) type {
         pairs[i] = .{ lineSplit[0], lineSplit[1] };
     }
 
-    const HighlightTLocal = createHighlighterEnum(&names);
+    const HighlightTLocal = createEnum(&names);
     var base_map = std.StaticStringMap([]const u8).initComptime(pairs);
 
-    const map = comptime blk: {
+    const html_map = comptime blk: {
         var map = std.EnumMap(HighlightTLocal, []const u8).init(.{});
         switch (@typeInfo(HighlightTLocal)) {
             .@"enum" => |enumInfo| {
@@ -39,9 +130,12 @@ pub fn parseNameMap(contents: []const u8) type {
         }
     };
 
+    const terminal_map = comptime buildTerminalStyleMap(HighlightTLocal, html_map);
+
     return struct {
         pub const HighlightT = HighlightTLocal;
-        pub var style_map = map;
+        pub var html_class_map = html_map;
+        pub var terminal_code_map = terminal_map;
     };
 }
 
@@ -49,7 +143,7 @@ const RendererOpts = struct {
     base_tree: ?*ts.Tree = null,
 };
 
-pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype, style_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
+pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype, class_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
     var iter = try highlighter.highlight(source, opts.base_tree);
     defer iter.destroy();
     while (try iter.next()) |event| {
@@ -58,7 +152,7 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
                 try out.print("{s}", .{source[range.start..range.end]});
             },
             .HighlightStart => |highlight_val| {
-                try out.print("<span style=\"{s}\">", .{style_map.get(highlight_val) orelse unreachable});
+                try out.print("<span style=\"{s}\">", .{class_map.get(highlight_val) orelse unreachable});
             },
             .HighlightEnd => {
                 try out.print("</span>", .{});
@@ -68,7 +162,26 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
     try out.flush();
 }
 
-pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: anytype, style_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
+pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anytype, code_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
+    var iter = try highlighter.highlight(source, opts.base_tree);
+    defer iter.destroy();
+    while (try iter.next()) |event| {
+        switch (event) {
+            .Source => |range| {
+                try out.print("{s}", .{source[range.start..range.end]});
+            },
+            .HighlightStart => |highlight_val| {
+                try out.print("\x1b[{s}m", .{code_map.get(highlight_val) orelse unreachable});
+            },
+            .HighlightEnd => {
+                try out.print("\x1b[0m", .{});
+            },
+        }
+    }
+    try out.flush();
+}
+
+pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: anytype, class_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
     try out.print("<ul>", .{});
     var iter = try highlighter.highlightLines(source, opts.base_tree);
     defer iter.destroy();
@@ -78,7 +191,7 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
                 try out.print("{s}", .{source[range.start..range.end]});
             },
             .HighlightStart => |highlight_val| {
-                try out.print("<span style=\"{s}\">", .{style_map.get(highlight_val) orelse unreachable});
+                try out.print("<span style=\"{s}\">", .{class_map.get(highlight_val) orelse unreachable});
             },
             .HighlightEnd => {
                 try out.print("</span>", .{});
@@ -370,7 +483,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     }
                 }
 
-                return HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.end } };
+                const evt = HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.end } };
+                if (self.event_queue.dequeue()) |queued_event| {
+                    try self.event_queue.enqueue(evt);
+                    return queued_event;
+                }
+                return evt;
             }
 
             pub fn next(self: *Self) !?HighlightDelimitedEvent {
@@ -613,7 +731,7 @@ pub fn matchName(comptime T: type, captured_name: []const u8) ?T {
     return best_match;
 }
 
-pub fn createHighlighterEnum(comptime highlight_names: []const []const u8) type {
+pub fn createEnum(comptime highlight_names: []const []const u8) type {
     var fields: [highlight_names.len]std.builtin.Type.EnumField = undefined;
 
     for (highlight_names, 0..) |name, i| {
@@ -637,13 +755,13 @@ pub fn getFirstValue(comptime EnumType: type) EnumType {
     return @enumFromInt(0);
 }
 
-test "createHighlighterEnum" {
+test "createEnum" {
     const highlight_names = &[_][]const u8{
         "punctuation.special",
         "keyword",
     };
 
-    const HighlightEnum = createHighlighterEnum(highlight_names);
+    const HighlightEnum = createEnum(highlight_names);
     const value: HighlightEnum = .@"punctuation.special";
 
     switch (getFirstValue(HighlightEnum)) {
@@ -667,7 +785,7 @@ test "createHighlighterEnum" {
 }
 
 test "basic matchName" {
-    const HighlightEnum = createHighlighterEnum(&std_names);
+    const HighlightEnum = createEnum(&std_names);
     try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
 }
 

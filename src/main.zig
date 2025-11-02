@@ -39,7 +39,7 @@ pub fn main() !void {
     var writer = std.fs.File.stdout().writer(&buf);
     const out = &writer.interface;
 
-    try default.renderHTML(contents, out, highlighter, default.std_name_map.style_map, .{});
+    try default.renderTerminal(contents, out, highlighter, default.std_name_map.terminal_code_map, .{});
 }
 
 test "simple test" {
