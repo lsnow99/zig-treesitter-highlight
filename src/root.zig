@@ -163,7 +163,7 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
 }
 
 pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anytype, code_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
-    var iter = try highlighter.highlight(source, opts.base_tree);
+    var iter = try highlighter.highlightLines(source, opts.base_tree);
     defer iter.destroy();
     while (try iter.next()) |event| {
         switch (event) {
@@ -175,6 +175,10 @@ pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anyt
             },
             .HighlightEnd => {
                 try out.print("\x1b[0m", .{});
+            },
+            .LineStart => {},
+            .LineEnd => {
+                try out.print("\n", .{});
             },
         }
     }
@@ -320,6 +324,28 @@ pub fn createHighlighterConfig(HighlightT: type) type {
         HighlightEnd: void,
         LineStart: void,
         LineEnd: void,
+
+        const Self = @This();
+
+        pub fn print(self: Self, source: []const u8) void {
+            switch (self) {
+                .Source => |range| {
+                    std.debug.print("Source: {d}-{d} <{s}>\n", .{ range.start, range.end, source[range.start..range.end] });
+                },
+                .HighlightStart => |highlight_val| {
+                    std.debug.print("HighlightStart: {}\n", .{highlight_val});
+                },
+                .HighlightEnd => {
+                    std.debug.print("HighlightEnd\n", .{});
+                },
+                .LineStart => {
+                    std.debug.print("LineStart\n", .{});
+                },
+                .LineEnd => {
+                    std.debug.print("LineEnd\n", .{});
+                },
+            }
+        }
     };
 
     return struct {
@@ -460,7 +486,9 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                 // IMPROVE: carriage returns?
                 while (std.mem.indexOfScalar(u8, sliced, self.delimiter)) |i| {
-                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
+                    if (i > 0) {
+                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
+                    }
 
                     start += i + 1;
                     offset += start;
@@ -492,7 +520,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             }
 
             pub fn next(self: *Self) !?HighlightDelimitedEvent {
-                while (self.event_queue.dequeue()) |event| {
+                if (self.event_queue.dequeue()) |event| {
                     return event;
                 }
                 if (try self.base_iterator.next()) |event| {
