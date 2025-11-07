@@ -255,6 +255,14 @@ pub fn Queue(comptime Child: type) type {
             self.end = node;
             self.len += 1;
         }
+        pub fn pushLeft(self: *Self, value: Child) !void {
+            const node = try self.arena.allocator().create(QueueNode);
+            node.* = .{ .data = value, .next = null };
+            if (self.start) |start| start.next = node else self.start = node;
+            if (self.end) |_| {} else self.end = node;
+            self.start = node;
+            self.len += 1;
+        }
         pub fn dequeue(self: *Self) ?Child {
             const start = self.start orelse return null;
             defer self.arena.allocator().destroy(start);
@@ -528,7 +536,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                         self.initial_line_started = true;
                         switch (event) {
                             .Source => |range| {
-                                try self.event_queue.enqueue(try self.handleSource(range));
+                                try self.event_queue.pushLeft(try self.handleSource(range));
                             },
                             else => try self.event_queue.enqueue(HighlightDelimitedIterator.transformEvent(event)),
                         }
