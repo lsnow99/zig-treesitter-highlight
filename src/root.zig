@@ -176,16 +176,13 @@ pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anyt
             .HighlightEnd => {
                 try out.print("\x1b[0m", .{});
             },
-            .LineStart => {
-                try out.print("LS\n", .{});
-            },
+            .LineStart => {},
             .LineEnd => {
-                try out.print("LE", .{});
                 try out.print("\n", .{});
             },
         }
-        try out.flush();
     }
+    try out.flush();
 }
 
 pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: anytype, class_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
@@ -494,7 +491,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                 // IMPROVE: carriage returns?
                 while (std.mem.indexOfScalar(u8, sliced, self.delimiter)) |i| {
-                    std.debug.print("i: {d}\n", .{i});
                     if (i > 0) {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
                     }
@@ -506,14 +502,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     for (self.highlight_stack.items) |_| {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightEnd = {} });
                     }
-                    std.debug.print("queueing line end\n", .{});
                     try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineEnd = {} });
 
                     if (sliced.len == 0) {
                         break;
                     }
 
-                    std.debug.print("queueing line start\n", .{});
                     try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineStart = {} });
 
                     for (self.highlight_stack.items) |highlight_val| {
@@ -530,15 +524,13 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 const evt = HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.end } };
                 if (self.event_queue.dequeue()) |queued_event| {
                     try self.event_queue.enqueue(evt);
-                    std.debug.print("dequeued: {any}\n", .{queued_event});
-                    std.debug.print("enqueued: {any}\n", .{evt});
                     return queued_event;
                 }
                 return evt;
             }
 
             pub fn emitEvent(self: *Self, event: ?HighlightDelimitedEvent) !?HighlightDelimitedEvent {
-                self.last_event_was_line_end = if(event) |ev| ev == .LineEnd else false;
+                self.last_event_was_line_end = if (event) |ev| ev == .LineEnd else false;
                 self.in_a_line &= !self.last_event_was_line_end;
                 return event;
             }
@@ -552,15 +544,9 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                         self.in_a_line = true;
                         switch (event) {
                             .Source => |range| {
-                                std.debug.print("Source: {d}-{d} <{s}>\n", .{ range.start, range.end, self.base_iterator.source[range.start..range.end] });
                                 try self.event_queue.pushLeft(try self.handleSource(range));
-                                std.debug.print("queued length: {d}\n", .{self.event_queue.len});
                             },
                             else => try self.event_queue.enqueue(HighlightDelimitedIterator.transformEvent(event)),
-                        }
-                        var iter = self.event_queue.iter();
-                        while (iter.next()) |queued_event| {
-                            std.debug.print("queued: {any}\n", .{queued_event});
                         }
                         return self.emitEvent(HighlightDelimitedEvent{ .LineStart = {} });
                     }
