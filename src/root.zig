@@ -158,8 +158,8 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
                 try out.print("</span>", .{});
             },
         }
+        try out.flush();
     }
-    try out.flush();
 }
 
 pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anytype, code_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
@@ -531,6 +531,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
             pub fn emitEvent(self: *Self, event: ?HighlightDelimitedEvent) !?HighlightDelimitedEvent {
                 self.last_event_was_line_end = if (event) |ev| ev == .LineEnd else false;
+                self.in_a_line |= if (event) |ev| ev == .LineStart else false;
                 self.in_a_line &= !self.last_event_was_line_end;
                 return event;
             }
@@ -541,7 +542,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 }
                 if (try self.base_iterator.next()) |event| {
                     if (!self.in_a_line) {
-                        self.in_a_line = true;
                         switch (event) {
                             .Source => |range| {
                                 try self.event_queue.pushLeft(try self.handleSource(range));
