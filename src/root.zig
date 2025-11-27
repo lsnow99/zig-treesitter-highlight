@@ -1,6 +1,8 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const ts = @import("tree-sitter");
+const Queue = @import("queue.zig").Queue;
+const ComptimeBufferedQueue = @import("queue.zig").ComptimeBufferedQueue;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
@@ -176,8 +178,8 @@ pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anyt
             .HighlightEnd => {
                 try out.print("\x1b[0m", .{});
             },
-            .LineStart => {},
-            .LineEnd => {
+            .DelimStart => {},
+            .DelimEnd => {
                 try out.print("\n", .{});
             },
         }
@@ -200,10 +202,10 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
             .HighlightEnd => {
                 try out.print("</span>", .{});
             },
-            .LineStart => {
+            .DelimStart => {
                 try out.print("<li>", .{});
             },
-            .LineEnd => {
+            .DelimEnd => {
                 try out.print("</li>", .{});
             },
         }
@@ -213,100 +215,6 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
 }
 
 pub const std_name_map = parseNameMap(@embedFile("standard_names"));
-
-pub fn Queue(comptime Child: type) type {
-    return struct {
-        const Self = @This();
-        const QueueNode = struct {
-            data: Child,
-            next: ?*QueueNode,
-        };
-        const Iterator = struct {
-            cur: ?*QueueNode,
-
-            pub fn next(self: *@This()) ?Child {
-                if (self.cur) |cur| {
-                    self.cur = cur.next;
-                    return cur.data;
-                }
-                return null;
-            }
-        };
-
-        arena: std.heap.ArenaAllocator,
-        start: ?*QueueNode,
-        end: ?*QueueNode,
-        len: usize = 0,
-
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return Self{
-                .arena = std.heap.ArenaAllocator.init(allocator),
-                .start = null,
-                .end = null,
-            };
-        }
-        pub fn peek(self: *Self) ?Child {
-            return if (self.start) |start| start.data else null;
-        }
-        pub fn enqueue(self: *Self, value: Child) !void {
-            const node = try self.arena.allocator().create(QueueNode);
-            node.* = .{ .data = value, .next = null };
-            if (self.end) |end| end.next = node else self.start = node;
-            self.end = node;
-            self.len += 1;
-        }
-        pub fn pushLeft(self: *Self, value: Child) !void {
-            const node = try self.arena.allocator().create(QueueNode);
-            node.* = .{ .data = value, .next = self.start };
-            if (self.end) |_| {} else self.end = node;
-            self.start = node;
-            self.len += 1;
-        }
-        pub fn dequeue(self: *Self) ?Child {
-            const start = self.start orelse return null;
-            defer self.arena.allocator().destroy(start);
-            if (start.next) |next|
-                self.start = next
-            else {
-                self.start = null;
-                self.end = null;
-            }
-            self.len -= 1;
-            return start.data;
-        }
-        // Destroys the queue. Future calls to queue methods are undefined after destroy()
-        pub fn destroy(self: *Self) void {
-            self.arena.deinit();
-        }
-        // Clears the queue but does not destroy the backing allocator
-        pub fn clear(self: *Self, mode: ?std.heap.ArenaAllocator.ResetMode) void {
-            self.allocator.reset(mode orelse .free_all);
-            self.start = null;
-            self.end = null;
-            self.len = 0;
-        }
-        pub fn iter(self: *Self) Iterator {
-            return Iterator{
-                .cur = self.start,
-            };
-        }
-    };
-}
-
-test "queue" {
-    var queue = Queue(u32).init(std.testing.allocator);
-    defer queue.destroy();
-    try queue.enqueue(1);
-    try queue.enqueue(2);
-    try queue.enqueue(3);
-    try std.testing.expect(queue.peek() == 1);
-    try std.testing.expect(queue.dequeue() == 1);
-    try std.testing.expect(queue.peek() == 2);
-    try std.testing.expect(queue.dequeue() == 2);
-    try std.testing.expect(queue.peek() == 3);
-    try std.testing.expect(queue.dequeue() == 3);
-    try std.testing.expect(queue.peek() == null);
-}
 
 const HighlightTree = union(enum) {
     Owned: *ts.Tree,
@@ -318,19 +226,54 @@ const HighlightRange = struct {
     end: usize,
 };
 
-pub fn createHighlighterConfig(HighlightT: type) type {
-    const HighlightEvent = union(enum) {
+// Combine two iterators, where iter_a always has priority over iter_b. That is, for regions where highlights from
+// iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
+// iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Does not allocate.
+// pub fn combineIterators(HighlightT: type, iter_a: EventIteratorT(HighlightT), iter_b: EventIteratorT(HighlightT)) !HighlightEventIteratorT(HighlightT) {
+//     const IterState = struct {
+//         cur_highlight: ?HighlightT = null,
+//         next_highlight: ?HighlightT = null,
+//         cur_range: ?HighlightRange = null,
+//         next_range: ?HighlightRange = null,
+//     };
+//
+//     var a_state = IterState{};
+//     var b_state = IterState{};
+//
+//     _ = iter_a.next();
+//
+//     // if it is a highlight event, then emit right away
+//
+//     _ = a_state;
+//     _ = b_state;
+//
+//     while (a_state.cur_range == null) {
+//
+//     }
+//
+//     return struct {
+//         const Self = @This();
+//         pub fn next(self: Self) !?HighlightT {
+//
+//         }
+//     };
+// }
+
+pub fn HighlightEventT(HighlightT: type) type {
+    return union(enum) {
         Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
     };
+}
 
-    const HighlightDelimitedEvent = union(enum) {
+pub fn HighlightDelimitedEventT(HighlightT: type) type {
+    return union(enum) {
         Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
-        LineStart: void,
-        LineEnd: void,
+        DelimStart: void,
+        DelimEnd: void,
 
         const Self = @This();
 
@@ -345,15 +288,69 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 .HighlightEnd => {
                     std.debug.print("HighlightEnd\n", .{});
                 },
-                .LineStart => {
-                    std.debug.print("LineStart\n", .{});
+                .DelimStart => {
+                    std.debug.print("DelimStart\n", .{});
                 },
-                .LineEnd => {
-                    std.debug.print("LineEnd\n", .{});
+                .DelimEnd => {
+                    std.debug.print("DelimEnd\n", .{});
                 },
             }
         }
     };
+}
+
+pub fn EventIteratorT(EventT: type) type {
+    // Approach inspired by Karl Seguin's [Zig Interfaces](https://www.openmymind.net/Zig-Interfaces/)
+    return struct {
+        ptr: *anyopaque,
+        nextFn: *const fn (ptr: *anyopaque) anyerror!?EventT,
+
+        fn init(ptr: anytype) @This() {
+            const T = @TypeOf(ptr);
+            const ptr_info = @typeInfo(T);
+
+            const gen = struct {
+                pub fn next(pointer: *anyopaque) !?EventT {
+                    const self: T = @ptrCast(@alignCast(pointer));
+                    return ptr_info.@"pointer".child.next(self);
+                }
+            };
+
+            return .{
+                .ptr = ptr,
+                .nextFn = gen.next,
+            };
+        }
+
+        fn next(self: @This()) !?EventT {
+            // TODO: test passing self to check for errors
+            return self.nextFn(self.ptr);
+        }
+    };
+}
+
+// pub fn DelimitedEventIterator(Event: type) type {
+//
+//     return struct {
+//         const Self = @This();
+//         base_iterator: EventIteratorT(Event),
+//
+//         pub fn init(base_iterator: EventIteratorT(Event)) Self {
+//             return .{
+//                 .base_iterator = base_iterator,
+//             };
+//         }
+//
+//         pub fn next(self: *Self) !?Event {
+//
+//         }
+//     };
+// }
+
+pub fn createHighlighterConfig(HighlightT: type) type {
+    const HighlightEvent = HighlightEventT(HighlightT);
+
+    const HighlightDelimitedEvent = HighlightDelimitedEventT(HighlightT);
 
     return struct {
         // Improve: can't use Self twice
@@ -502,13 +499,13 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     for (self.highlight_stack.items) |_| {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightEnd = {} });
                     }
-                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineEnd = {} });
+                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .DelimEnd = {} });
 
                     if (sliced.len == 0) {
                         break;
                     }
 
-                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineStart = {} });
+                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .DelimStart = {} });
 
                     for (self.highlight_stack.items) |highlight_val| {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
@@ -530,8 +527,8 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             }
 
             pub fn emitEvent(self: *Self, event: ?HighlightDelimitedEvent) !?HighlightDelimitedEvent {
-                self.last_event_was_line_end = if (event) |ev| ev == .LineEnd else false;
-                self.in_a_line |= if (event) |ev| ev == .LineStart else false;
+                self.last_event_was_line_end = if (event) |ev| ev == .DelimEnd else false;
+                self.in_a_line |= if (event) |ev| ev == .DelimStart else false;
                 self.in_a_line &= !self.last_event_was_line_end;
                 return event;
             }
@@ -548,7 +545,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                             },
                             else => try self.event_queue.enqueue(HighlightDelimitedIterator.transformEvent(event)),
                         }
-                        return self.emitEvent(HighlightDelimitedEvent{ .LineStart = {} });
+                        return self.emitEvent(HighlightDelimitedEvent{ .DelimStart = {} });
                     }
 
                     switch (event) {
@@ -567,7 +564,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 }
 
                 if (self.in_a_line and !self.last_event_was_line_end) {
-                    return self.emitEvent(HighlightDelimitedEvent{ .LineEnd = {} });
+                    return self.emitEvent(HighlightDelimitedEvent{ .DelimEnd = {} });
                 }
 
                 return self.emitEvent(null);
