@@ -21,8 +21,6 @@ fn IteratorT(Child: type) type {
 }
 
 pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) type {
-    const QueueNode = QueueNodeT(Child);
-
     return struct {
         const Self = @This();
 
@@ -78,21 +76,21 @@ pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) ty
         }
 
         // Modifying the queue while iterating is undefined.
-        pub fn iter(self: *Self) type {
-            return struct {
-                num_returned: usize = 0,
-                queue = self,
-
-                pub fn next(self: *@This()) ?Child {
-                    if (num_returned == self.queue.len) {
-                        return null;
-                    }
-                    const next_ix = (self.start + self.num_returned) % buffer_size;
-                    self.num_returned += 1;
-                    return self.queue.buffer[next_ix];
-                }
-            };
-        }
+        // pub fn iter(self: *Self) type {
+        //     return struct {
+        //         num_returned: usize,
+        //         queue: *Self,
+        //
+        //         pub fn next(self: *@This()) ?Child {
+        //             if (num_returned == self.queue.len) {
+        //                 return null;
+        //             }
+        //             const next_ix = (self.start + self.num_returned) % buffer_size;
+        //             self.num_returned += 1;
+        //             return self.queue.buffer[next_ix];
+        //         }
+        //     };
+        // }
     };
 }
 

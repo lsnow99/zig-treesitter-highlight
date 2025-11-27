@@ -461,7 +461,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
             delimiter: u8,
             base_iterator: HighlightEventIterator,
-            highlight_stack: std.ArrayList(HighlightT),
+            current_highlight: ?HighlightT = null,
             event_queue: Queue(HighlightDelimitedEvent),
             last_event_was_line_end: bool = false,
             in_a_line: bool = false,
@@ -496,7 +496,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     offset += start;
                     sliced = raw_sliced[start..];
 
-                    for (self.highlight_stack.items) |_| {
+                    if (self.current_highlight) |_| {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightEnd = {} });
                     }
                     try self.event_queue.enqueue(HighlightDelimitedEvent{ .DelimEnd = {} });
@@ -507,7 +507,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                     try self.event_queue.enqueue(HighlightDelimitedEvent{ .DelimStart = {} });
 
-                    for (self.highlight_stack.items) |highlight_val| {
+                    if (self.current_highlight) |highlight_val| {
                         try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
                     }
                 }
@@ -550,11 +550,12 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                     switch (event) {
                         .HighlightStart => |highlight_val| {
-                            try self.highlight_stack.append(self.base_iterator.highlighter.allocator, highlight_val);
+                            std.debug.assert(self.current_highlight == null);
+                            self.current_highlight = highlight_val;
                             return self.emitEvent(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
                         },
                         .HighlightEnd => {
-                            _ = self.highlight_stack.pop();
+                            self.current_highlight = null;
                             return self.emitEvent(HighlightDelimitedEvent{ .HighlightEnd = {} });
                         },
                         .Source => |range| {
@@ -572,7 +573,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
             pub fn destroy(self: *Self) void {
                 self.base_iterator.destroy();
-                self.highlight_stack.deinit(self.base_iterator.highlighter.allocator);
                 self.event_queue.destroy();
             }
         };
@@ -639,7 +639,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
         pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator {
             return HighlightDelimitedIterator{
                 .base_iterator = try self.highlight(source, tree),
-                .highlight_stack = .{},
                 .event_queue = Queue(HighlightDelimitedEvent).init(self.allocator),
                 .delimiter = delimiter,
             };
