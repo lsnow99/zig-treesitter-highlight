@@ -304,7 +304,6 @@ pub fn EventIteratorT(EventT: type) type {
     return struct {
         ptr: *anyopaque,
         nextFn: *const fn (ptr: *anyopaque) anyerror!?EventT,
-        destroyFn: *const fn (ptr: *anyopaque) void,
 
         fn init(ptr: anytype) @This() {
             const T = @TypeOf(ptr);
@@ -315,27 +314,17 @@ pub fn EventIteratorT(EventT: type) type {
                     const self: T = @ptrCast(@alignCast(pointer));
                     return ptr_info.pointer.child.next(self);
                 }
-
-                pub fn destroy(pointer: *anyopaque) void {
-                    const self: T = @ptrCast(@alignCast(pointer));
-                    return ptr_info.pointer.child.destroy(self);
-                }
             };
 
             return .{
                 .ptr = ptr,
                 .nextFn = gen.next,
-                .destroyFn = gen.destroy,
             };
         }
 
         pub fn next(self: @This()) !?EventT {
             // TODO: test passing self to check for errors
             return self.nextFn(self.ptr);
-        }
-
-        pub fn destroy(self: @This()) void {
-            return self.destroyFn(self.ptr);
         }
     };
 }
@@ -769,19 +758,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 .highlighter = self,
                 .captures = captures,
             };
-        }
-
-        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightDelimitedIterator(HighlightT) {
-            return self.highlightDelimited(source, tree, '\n');
-        }
-
-        pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator(HighlightT) {
-            const highlighter = try self.highlight(source, tree);
-            return HighlightDelimitedIterator(HighlightT).init(
-                delimiter,
-                highlighter,
-                source,
-            );
         }
 
         // Note: does not destroy the language

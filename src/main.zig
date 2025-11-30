@@ -34,9 +34,8 @@ pub fn main() !void {
     var highlighter_cfg = try default.createHighlighterConfig(HighlightT).create(allocator, python_language, raw_query);
     defer highlighter_cfg.destroy();
     var highlighter = try highlighter_cfg.highlight(contents, null);
+    defer highlighter.destroy();
     const highlight_iter = highlighter.iter();
-    defer highlight_iter.destroy();
-
 
     var buf: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buf);
