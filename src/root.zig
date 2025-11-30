@@ -1,6 +1,8 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const ts = @import("tree-sitter");
+const Queue = @import("queue.zig").Queue;
+const ComptimeBufferedQueue = @import("queue.zig").ComptimeBufferedQueue;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
@@ -162,10 +164,10 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
     }
 }
 
-pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anytype, code_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
-    var iter = try highlighter.highlightLines(source, opts.base_tree);
-    defer iter.destroy();
-    while (try iter.next()) |event| {
+pub fn renderTerminal(Highlight: type, source: []const u8, out: *std.io.Writer, highlighter: EventIteratorT(HighlightEventT(Highlight)), code_map: std.EnumMap(Highlight, []const u8)) !void {
+    var delim_iter = HighlightDelimitedIterator(Highlight).init('\n', highlighter, source);
+    defer delim_iter.destroy();
+    while (try delim_iter.next()) |event| {
         switch (event) {
             .Source => |range| {
                 try out.print("{s}", .{source[range.start..range.end]});
@@ -176,8 +178,8 @@ pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anyt
             .HighlightEnd => {
                 try out.print("\x1b[0m", .{});
             },
-            .LineStart => {},
-            .LineEnd => {
+            .DelimStart => {},
+            .DelimEnd => {
                 try out.print("\n", .{});
             },
         }
@@ -200,10 +202,10 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
             .HighlightEnd => {
                 try out.print("</span>", .{});
             },
-            .LineStart => {
+            .DelimStart => {
                 try out.print("<li>", .{});
             },
-            .LineEnd => {
+            .DelimEnd => {
                 try out.print("</li>", .{});
             },
         }
@@ -213,100 +215,6 @@ pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: any
 }
 
 pub const std_name_map = parseNameMap(@embedFile("standard_names"));
-
-pub fn Queue(comptime Child: type) type {
-    return struct {
-        const Self = @This();
-        const QueueNode = struct {
-            data: Child,
-            next: ?*QueueNode,
-        };
-        const Iterator = struct {
-            cur: ?*QueueNode,
-
-            pub fn next(self: *@This()) ?Child {
-                if (self.cur) |cur| {
-                    self.cur = cur.next;
-                    return cur.data;
-                }
-                return null;
-            }
-        };
-
-        arena: std.heap.ArenaAllocator,
-        start: ?*QueueNode,
-        end: ?*QueueNode,
-        len: usize = 0,
-
-        pub fn init(allocator: std.mem.Allocator) Self {
-            return Self{
-                .arena = std.heap.ArenaAllocator.init(allocator),
-                .start = null,
-                .end = null,
-            };
-        }
-        pub fn peek(self: *Self) ?Child {
-            return if (self.start) |start| start.data else null;
-        }
-        pub fn enqueue(self: *Self, value: Child) !void {
-            const node = try self.arena.allocator().create(QueueNode);
-            node.* = .{ .data = value, .next = null };
-            if (self.end) |end| end.next = node else self.start = node;
-            self.end = node;
-            self.len += 1;
-        }
-        pub fn pushLeft(self: *Self, value: Child) !void {
-            const node = try self.arena.allocator().create(QueueNode);
-            node.* = .{ .data = value, .next = self.start };
-            if (self.end) |_| {} else self.end = node;
-            self.start = node;
-            self.len += 1;
-        }
-        pub fn dequeue(self: *Self) ?Child {
-            const start = self.start orelse return null;
-            defer self.arena.allocator().destroy(start);
-            if (start.next) |next|
-                self.start = next
-            else {
-                self.start = null;
-                self.end = null;
-            }
-            self.len -= 1;
-            return start.data;
-        }
-        // Destroys the queue. Future calls to queue methods are undefined after destroy()
-        pub fn destroy(self: *Self) void {
-            self.arena.deinit();
-        }
-        // Clears the queue but does not destroy the backing allocator
-        pub fn clear(self: *Self, mode: ?std.heap.ArenaAllocator.ResetMode) void {
-            self.allocator.reset(mode orelse .free_all);
-            self.start = null;
-            self.end = null;
-            self.len = 0;
-        }
-        pub fn iter(self: *Self) Iterator {
-            return Iterator{
-                .cur = self.start,
-            };
-        }
-    };
-}
-
-test "queue" {
-    var queue = Queue(u32).init(std.testing.allocator);
-    defer queue.destroy();
-    try queue.enqueue(1);
-    try queue.enqueue(2);
-    try queue.enqueue(3);
-    try std.testing.expect(queue.peek() == 1);
-    try std.testing.expect(queue.dequeue() == 1);
-    try std.testing.expect(queue.peek() == 2);
-    try std.testing.expect(queue.dequeue() == 2);
-    try std.testing.expect(queue.peek() == 3);
-    try std.testing.expect(queue.dequeue() == 3);
-    try std.testing.expect(queue.peek() == null);
-}
 
 const HighlightTree = union(enum) {
     Owned: *ts.Tree,
@@ -318,19 +226,54 @@ const HighlightRange = struct {
     end: usize,
 };
 
-pub fn createHighlighterConfig(HighlightT: type) type {
-    const HighlightEvent = union(enum) {
+// Combine two iterators, where iter_a always has priority over iter_b. That is, for regions where highlights from
+// iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
+// iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Does not allocate.
+// pub fn combineIterators(HighlightT: type, iter_a: EventIteratorT(HighlightT), iter_b: EventIteratorT(HighlightT)) !HighlightEventIteratorT(HighlightT) {
+//     const IterState = struct {
+//         cur_highlight: ?HighlightT = null,
+//         next_highlight: ?HighlightT = null,
+//         cur_range: ?HighlightRange = null,
+//         next_range: ?HighlightRange = null,
+//     };
+//
+//     var a_state = IterState{};
+//     var b_state = IterState{};
+//
+//     _ = iter_a.next();
+//
+//     // if it is a highlight event, then emit right away
+//
+//     _ = a_state;
+//     _ = b_state;
+//
+//     while (a_state.cur_range == null) {
+//
+//     }
+//
+//     return struct {
+//         const Self = @This();
+//         pub fn next(self: Self) !?HighlightT {
+//
+//         }
+//     };
+// }
+
+pub fn HighlightEventT(HighlightT: type) type {
+    return union(enum) {
         Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
     };
+}
 
-    const HighlightDelimitedEvent = union(enum) {
+pub fn HighlightDelimitedEventT(HighlightT: type) type {
+    return union(enum) {
         Source: HighlightRange,
         HighlightStart: HighlightT,
         HighlightEnd: void,
-        LineStart: void,
-        LineEnd: void,
+        DelimStart: void,
+        DelimEnd: void,
 
         const Self = @This();
 
@@ -345,15 +288,311 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 .HighlightEnd => {
                     std.debug.print("HighlightEnd\n", .{});
                 },
-                .LineStart => {
-                    std.debug.print("LineStart\n", .{});
+                .DelimStart => {
+                    std.debug.print("DelimStart\n", .{});
                 },
-                .LineEnd => {
-                    std.debug.print("LineEnd\n", .{});
+                .DelimEnd => {
+                    std.debug.print("DelimEnd\n", .{});
                 },
             }
         }
     };
+}
+
+pub fn EventIteratorT(EventT: type) type {
+    // Approach inspired by Karl Seguin's [Zig Interfaces](https://www.openmymind.net/Zig-Interfaces/)
+    return struct {
+        ptr: *anyopaque,
+        nextFn: *const fn (ptr: *anyopaque) anyerror!?EventT,
+
+        fn init(ptr: anytype) @This() {
+            const T = @TypeOf(ptr);
+            const ptr_info = @typeInfo(T);
+
+            const gen = struct {
+                pub fn next(pointer: *anyopaque) !?EventT {
+                    const self: T = @ptrCast(@alignCast(pointer));
+                    return ptr_info.pointer.child.next(self);
+                }
+            };
+
+            return .{
+                .ptr = ptr,
+                .nextFn = gen.next,
+            };
+        }
+
+        pub fn next(self: @This()) !?EventT {
+            // TODO: test passing self to check for errors
+            return self.nextFn(self.ptr);
+        }
+    };
+}
+
+const RangeIterator = EventIteratorT(HighlightRange);
+
+pub fn StaticHighlighter(Highlight: type) type {
+    return struct {
+        const Self = @This();
+
+        source: []const u8,
+        range_iter: RangeIterator,
+        needs_open: bool = false,
+        last_emitted_ix: ?u64 = null,
+        cur_range: ?HighlightRange = null,
+        highlight: Highlight,
+
+        pub fn init(source: []const u8, range_iter: RangeIterator, highlight: Highlight) Self {
+            return Self{
+                .source = source,
+                .range_iter = range_iter,
+                .highlight = highlight,
+            };
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(HighlightEventT(Highlight)) {
+            return EventIteratorT(HighlightEventT(Highlight)).init(self);
+        }
+
+        fn emitRange(self: *Self, range: HighlightRange) HighlightEventT(Highlight) {
+            self.last_emitted_ix = range.end;
+            return .{ .Source = range };
+        }
+
+        pub fn next(self: *Self) !?HighlightEventT(Highlight) {
+            if (self.needs_open) {
+                self.needs_open = false;
+                return .{ .HighlightStart = self.highlight };
+            }
+
+            if (self.cur_range) |range| {
+                if (self.last_emitted_ix == null or self.last_emitted_ix.? != range.end) {
+                    return self.emitRange(range);
+                }
+                self.cur_range = null;
+                return .{ .HighlightEnd = {} };
+            }
+
+            if (try self.range_iter.next()) |range| {
+                self.cur_range = range;
+                std.debug.assert(self.last_emitted_ix == null or range.start > self.last_emitted_ix.?);
+                if (self.last_emitted_ix == null or range.start > self.last_emitted_ix.? + 1) {
+                    self.needs_open = true;
+                    const start = if (self.last_emitted_ix) |ix| ix + 1 else 0;
+                    return self.emitRange(.{ .start = start, .end = range.start });
+                }
+                return .{ .HighlightStart = self.highlight };
+            }
+
+            if (self.last_emitted_ix == null or self.last_emitted_ix.? < self.source.len) {
+                const start = if (self.last_emitted_ix) |ix| ix else 0;
+                return self.emitRange(.{ .start = start, .end = self.source.len });
+            }
+
+            return null;
+        }
+
+        pub fn destroy(self: *Self) void {
+            self.range_iter.destroy();
+        }
+    };
+}
+
+pub fn StaticIterator(EventT: type) type {
+    return struct {
+        const Self = @This();
+
+        items: []const EventT,
+        ix: usize = 0,
+
+        pub fn init(items: []const EventT) Self {
+            return Self{
+                .items = items,
+            };
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(EventT) {
+            return EventIteratorT(EventT).init(self);
+        }
+
+        pub fn next(self: *Self) ?EventT {
+            if (self.ix < self.items.len) {
+                defer self.ix = self.ix + 1;
+                return self.items[self.ix];
+            }
+            return null;
+        }
+    };
+}
+
+test "StaticHighlighter" {
+    const Highlight = createEnum(&std_names);
+    const highlight = .@"function.method";
+    const source = "abckdfjsl3hdlzn";
+    const ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
+    const EventT = HighlightEventT(Highlight);
+    const expected_events = [_]EventT{
+        EventT{ .Source = .{ .start = 0, .end = 5 } },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 5, .end = 7 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .Source = .{ .start = 7, .end = source.len } },
+    };
+    var static_iter = StaticIterator(HighlightRange).init(ranges[0..]);
+    const range_iter = static_iter.iter();
+
+    var static_highlighter = StaticHighlighter(Highlight).init(source, range_iter, .@"function.method");
+    for (expected_events) |expected| {
+        const highlight_event = try static_highlighter.next();
+        if (highlight_event) |actual| {
+            try std.testing.expectEqualDeep(expected, actual);
+        } else {
+            unreachable;
+        }
+    }
+}
+
+pub fn HighlightDelimitedIterator(Highlight: type) type {
+    const HighlightDelimitedEvent = HighlightDelimitedEventT(Highlight);
+    const HighlightEvent = HighlightEventT(Highlight);
+
+    return struct {
+        const Self = @This();
+
+        delimiter: u8,
+        base_iterator: EventIteratorT(HighlightEventT(Highlight)),
+        source: []const u8,
+
+        current_highlight: ?Highlight = null,
+        next_event: ?HighlightDelimitedEvent = null,
+        next_range: ?HighlightRange = null,
+        last_event_was_line_end: bool = false,
+        in_a_line: bool = false,
+        did_emit: bool = false,
+
+        pub fn init(delimiter: u8, base_iterator: EventIteratorT(HighlightEventT(Highlight)), source: []const u8) Self {
+            return Self{
+                .delimiter = delimiter,
+                .base_iterator = base_iterator,
+                .source = source,
+            };
+        }
+
+        pub fn transformEvent(evt: HighlightEvent) HighlightDelimitedEvent {
+            switch (evt) {
+                .HighlightStart => {
+                    return HighlightDelimitedEvent{ .HighlightStart = evt.HighlightStart };
+                },
+                .HighlightEnd => {
+                    return HighlightDelimitedEvent{ .HighlightEnd = {} };
+                },
+                .Source => |range| {
+                    return HighlightDelimitedEvent{ .Source = .{ .start = range.start, .end = range.end } };
+                },
+            }
+        }
+
+        fn updateNextRange(self: *Self, start: usize, end: usize) void {
+            if (end - start <= 0) {
+                self.next_range = null;
+            } else {
+                self.next_range = HighlightRange{ .start = start, .end = end };
+            }
+        }
+
+        pub fn handleSource(self: *Self, range: HighlightRange) !HighlightDelimitedEvent {
+            const sliced = self.source[range.start..range.end];
+
+            std.debug.assert(sliced.len > 0);
+
+            if (std.mem.indexOfScalar(u8, sliced, self.delimiter)) |i| {
+                if (i > 0) {
+                    const next_start = range.start + i;
+                    self.updateNextRange(next_start, range.end);
+                    return HighlightDelimitedEvent{ .Source = .{ .start = range.start, .end = next_start } };
+                } else {
+                    self.updateNextRange(range.start + 1, range.end);
+                    if (self.current_highlight) |_| {
+                        self.next_event = HighlightDelimitedEvent{ .DelimEnd = {} };
+                        return HighlightDelimitedEvent{ .HighlightEnd = {} };
+                    }
+                    self.next_event = HighlightDelimitedEvent{ .DelimStart = {} };
+                    return HighlightDelimitedEvent{ .DelimEnd = {} };
+                }
+            }
+
+            self.next_range = null;
+            return HighlightDelimitedEvent{ .Source = range };
+        }
+
+        pub fn emitEvent(self: *Self, event: ?HighlightDelimitedEvent) !?HighlightDelimitedEvent {
+            self.last_event_was_line_end = if (event) |ev| ev == .DelimEnd else false;
+            self.in_a_line |= if (event) |ev| ev == .DelimStart else false;
+            self.in_a_line &= !self.last_event_was_line_end;
+            self.did_emit = true;
+            if (event) |ev| {
+                switch (ev) {
+                    .HighlightStart => |highlight_val| {
+                        self.current_highlight = highlight_val;
+                    },
+                    .HighlightEnd => {
+                        self.current_highlight = null;
+                    },
+                    else => {},
+                }
+            }
+            return event;
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(HighlightDelimitedEvent) {
+            return EventIteratorT(HighlightDelimitedEvent).init(self);
+        }
+
+        pub fn next(self: *Self) !?HighlightDelimitedEvent {
+            if (self.next_event) |event| {
+                switch (event) {
+                    .DelimEnd => {
+                        self.next_event = HighlightDelimitedEvent{ .DelimStart = {} };
+                    },
+                    else => {
+                        self.next_event = null;
+                    },
+                }
+                return try self.emitEvent(event);
+            }
+
+            if (self.next_range) |range| {
+                return try self.emitEvent(try self.handleSource(range));
+            }
+
+            if (!self.did_emit and self.source.len > 0) {
+                return try self.emitEvent(HighlightDelimitedEvent{ .DelimStart = {} });
+            }
+
+            if (try self.base_iterator.next()) |event| {
+                switch (event) {
+                    .Source => |range| {
+                        return self.emitEvent(try self.handleSource(range));
+                    },
+                    else => return self.emitEvent(HighlightDelimitedIterator(Highlight).transformEvent(event)),
+                }
+            }
+
+            if (self.in_a_line and !self.last_event_was_line_end) {
+                return self.emitEvent(HighlightDelimitedEvent{ .DelimEnd = {} });
+            }
+
+            return self.emitEvent(null);
+        }
+
+        pub fn destroy(_: *Self) void {
+            // Nothing to free
+        }
+    };
+}
+
+pub fn createHighlighterConfig(HighlightT: type) type {
+    const HighlightEvent = HighlightEventT(HighlightT);
 
     return struct {
         // Improve: can't use Self twice
@@ -389,6 +628,10 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
             pub fn printState(self: *Self) void {
                 std.debug.print("offset: {d}, last_highlight_range: {any}, next_event: {any}, captures.len: {d}\n", .{ self.offset, self.last_highlight_range, self.next_event, self.captures.len });
+            }
+
+            pub fn iter(self: *Self) EventIteratorT(HighlightEventT(HighlightT)) {
+                return EventIteratorT(HighlightEventT(HighlightT)).init(self);
             }
 
             pub fn next(self: *Self) !?HighlightEvent {
@@ -438,7 +681,10 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                     }
 
                     // Unreachable because every possible capture should have been collected and added to the capture_map in `create`
-                    const current_highlight = self.highlighter.capture_map.get(capture.index) orelse unreachable;
+                    const current_highlight = self.highlighter.capture_map.get(capture.index) orelse {
+                        std.debug.print("Unrecognized capture index: {d} in map of length {d}", .{ capture.index, self.highlighter.capture_map.count() });
+                        unreachable;
+                    };
 
                     self.last_highlight_range = range;
                     try self.highlight_last_byte_stack.append(self.highlighter.allocator, range.end_byte);
@@ -456,127 +702,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 }
                 self.captures.destroy();
                 self.highlight_last_byte_stack.deinit(self.highlighter.allocator);
-            }
-        };
-
-        const HighlightDelimitedIterator = struct {
-            const Self = @This();
-
-            delimiter: u8,
-            base_iterator: HighlightEventIterator,
-            highlight_stack: std.ArrayList(HighlightT),
-            event_queue: Queue(HighlightDelimitedEvent),
-            last_event_was_line_end: bool = false,
-            in_a_line: bool = false,
-
-            pub fn transformEvent(evt: HighlightEvent) HighlightDelimitedEvent {
-                switch (evt) {
-                    .HighlightStart => {
-                        return HighlightDelimitedEvent{ .HighlightStart = evt.HighlightStart };
-                    },
-                    .HighlightEnd => {
-                        return HighlightDelimitedEvent{ .HighlightEnd = {} };
-                    },
-                    .Source => |range| {
-                        return HighlightDelimitedEvent{ .Source = .{ .start = range.start, .end = range.end } };
-                    },
-                }
-            }
-
-            pub fn handleSource(self: *Self, range: HighlightRange) !HighlightDelimitedEvent {
-                const raw_sliced = self.base_iterator.source[range.start..range.end];
-                var sliced = raw_sliced;
-                var offset: usize = 0;
-                var start: usize = 0;
-
-                // IMPROVE: carriage returns?
-                while (std.mem.indexOfScalar(u8, sliced, self.delimiter)) |i| {
-                    if (i > 0) {
-                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.start + i + offset } });
-                    }
-
-                    start += i + 1;
-                    offset += start;
-                    sliced = raw_sliced[start..];
-
-                    for (self.highlight_stack.items) |_| {
-                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightEnd = {} });
-                    }
-                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineEnd = {} });
-
-                    if (sliced.len == 0) {
-                        break;
-                    }
-
-                    try self.event_queue.enqueue(HighlightDelimitedEvent{ .LineStart = {} });
-
-                    for (self.highlight_stack.items) |highlight_val| {
-                        try self.event_queue.enqueue(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
-                    }
-                }
-
-                if (range.start + start == range.end) {
-                    // Unreachable because we should have enqueued something for a source event- either line delimiters
-                    // or at least regular source bytes. This depends on the base_iterator not emitting empty sources.
-                    return self.event_queue.dequeue() orelse unreachable;
-                }
-
-                const evt = HighlightDelimitedEvent{ .Source = .{ .start = range.start + start, .end = range.end } };
-                if (self.event_queue.dequeue()) |queued_event| {
-                    try self.event_queue.enqueue(evt);
-                    return queued_event;
-                }
-                return evt;
-            }
-
-            pub fn emitEvent(self: *Self, event: ?HighlightDelimitedEvent) !?HighlightDelimitedEvent {
-                self.last_event_was_line_end = if (event) |ev| ev == .LineEnd else false;
-                self.in_a_line |= if (event) |ev| ev == .LineStart else false;
-                self.in_a_line &= !self.last_event_was_line_end;
-                return event;
-            }
-
-            pub fn next(self: *Self) !?HighlightDelimitedEvent {
-                if (self.event_queue.dequeue()) |event| {
-                    return self.emitEvent(event);
-                }
-                if (try self.base_iterator.next()) |event| {
-                    if (!self.in_a_line) {
-                        switch (event) {
-                            .Source => |range| {
-                                try self.event_queue.pushLeft(try self.handleSource(range));
-                            },
-                            else => try self.event_queue.enqueue(HighlightDelimitedIterator.transformEvent(event)),
-                        }
-                        return self.emitEvent(HighlightDelimitedEvent{ .LineStart = {} });
-                    }
-
-                    switch (event) {
-                        .HighlightStart => |highlight_val| {
-                            try self.highlight_stack.append(self.base_iterator.highlighter.allocator, highlight_val);
-                            return self.emitEvent(HighlightDelimitedEvent{ .HighlightStart = highlight_val });
-                        },
-                        .HighlightEnd => {
-                            _ = self.highlight_stack.pop();
-                            return self.emitEvent(HighlightDelimitedEvent{ .HighlightEnd = {} });
-                        },
-                        .Source => |range| {
-                            return self.emitEvent(try self.handleSource(range));
-                        },
-                    }
-                }
-
-                if (self.in_a_line and !self.last_event_was_line_end) {
-                    return self.emitEvent(HighlightDelimitedEvent{ .LineEnd = {} });
-                }
-
-                return self.emitEvent(null);
-            }
-
-            pub fn destroy(self: *Self) void {
-                self.base_iterator.destroy();
-                self.highlight_stack.deinit(self.base_iterator.highlighter.allocator);
-                self.event_queue.destroy();
             }
         };
 
@@ -632,19 +757,6 @@ pub fn createHighlighterConfig(HighlightT: type) type {
                 .source = source,
                 .highlighter = self,
                 .captures = captures,
-            };
-        }
-
-        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightDelimitedIterator {
-            return self.highlightDelimited(source, tree, '\n');
-        }
-
-        pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator {
-            return HighlightDelimitedIterator{
-                .base_iterator = try self.highlight(source, tree),
-                .highlight_stack = .{},
-                .event_queue = Queue(HighlightDelimitedEvent).init(self.allocator),
-                .delimiter = delimiter,
             };
         }
 
