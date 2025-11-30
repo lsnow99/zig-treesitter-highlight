@@ -221,7 +221,7 @@ const HighlightTree = union(enum) {
     Borrowed: *ts.Tree,
 };
 
-const HighlightRange = struct {
+pub const HighlightRange = struct {
     start: usize,
     end: usize,
 };
