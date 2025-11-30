@@ -329,6 +329,126 @@ pub fn EventIteratorT(EventT: type) type {
     };
 }
 
+const RangeIterator = EventIteratorT(HighlightRange);
+
+pub fn StaticHighlighter(Highlight: type) type {
+    return struct {
+        const Self = @This();
+
+        source: []const u8,
+        range_iter: RangeIterator,
+        needs_open: bool = false,
+        last_emitted_ix: ?u64 = null,
+        cur_range: ?HighlightRange = null,
+        highlight: Highlight,
+
+        pub fn init(source: []const u8, range_iter: RangeIterator, highlight: Highlight) Self {
+            return Self{
+                .source = source,
+                .range_iter = range_iter,
+                .highlight = highlight,
+            };
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(HighlightEventT(Highlight)) {
+            return EventIteratorT(HighlightEventT(Highlight)).init(self);
+        }
+
+        fn emitRange(self: *Self, range: HighlightRange) HighlightEventT(Highlight) {
+            self.last_emitted_ix = range.end;
+            return .{ .Source = range };
+        }
+
+        pub fn next(self: *Self) !?HighlightEventT(Highlight) {
+
+            if (self.needs_open) {
+                self.needs_open = false;
+                return .{ .HighlightStart = self.highlight };
+            }
+
+            if (self.cur_range) |range| {
+                if (self.last_emitted_ix == null or self.last_emitted_ix.? != range.end) {
+                    return self.emitRange(range);
+                }
+                self.cur_range = null;
+                return .{ .HighlightEnd = {} };
+            }
+
+            if (try self.range_iter.next()) |range| {
+                self.cur_range = range;
+                std.debug.assert(self.last_emitted_ix == null or range.start > self.last_emitted_ix.?);
+                if (self.last_emitted_ix == null or range.start > self.last_emitted_ix.? + 1) {
+                    self.needs_open = true;
+                    const start = if (self.last_emitted_ix) |ix| ix + 1 else 0;
+                    return self.emitRange(.{ .start = start, .end = range.start });
+                }
+                return .{ .HighlightStart = self.highlight };
+            }
+
+            if (self.last_emitted_ix == null or self.last_emitted_ix.? < self.source.len) {
+                const start = if (self.last_emitted_ix) |ix| ix else 0;
+                return self.emitRange(.{ .start = start, .end = self.source.len });
+            }
+
+            return null;
+        }
+    };
+}
+
+pub fn StaticIterator(EventT: type) type {
+    return struct {
+        const Self = @This();
+
+        items: []const EventT,
+        ix: usize = 0,
+
+        pub fn init(items: []const EventT) Self {
+            return Self{
+                .items = items,
+            };
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(EventT) {
+            return EventIteratorT(EventT).init(self);
+        }
+
+        pub fn next(self: *Self) ?EventT {
+            if (self.ix < self.items.len) {
+                defer self.ix = self.ix + 1;
+                return self.items[self.ix];
+            }
+            return null;
+        }
+    };
+}
+
+test "StaticHighlighter" {
+    const Highlight = createEnum(&std_names);
+    const highlight = .@"function.method";
+    const source = "abckdfjsl3hdlzn";
+    const ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
+    const EventT = HighlightEventT(Highlight);
+    const expected_events = [_]EventT{
+        EventT{ .Source = .{ .start = 0, .end = 5 } },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 5, .end = 7 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .Source = .{ .start = 7, .end = source.len } },
+    };
+    var static_iter = StaticIterator(HighlightRange).init(ranges[0..]);
+    const range_iter = static_iter.iter();
+
+    var static_highlighter = StaticHighlighter(Highlight).init(source, range_iter, .@"function.method");
+    for (expected_events) |expected| {
+        const highlight_event = try static_highlighter.next();
+        if (highlight_event) |actual| {
+            try std.testing.expectEqualDeep(expected, actual);
+        } else {
+            unreachable;
+        }
+    }
+}
+
 // pub fn DelimitedEventIterator(Event: type) type {
 //
 //     return struct {
