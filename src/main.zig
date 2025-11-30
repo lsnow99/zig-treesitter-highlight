@@ -31,15 +31,18 @@ pub fn main() !void {
     defer allocator.free(names);
 
     const HighlightT = default.std_name_map.HighlightT;
-    const highlighterConfig = default.createHighlighterConfig(HighlightT);
-    var highlighter = try highlighterConfig.create(allocator, python_language, raw_query);
-    defer highlighter.destroy();
+    var highlighter_cfg = try default.createHighlighterConfig(HighlightT).create(allocator, python_language, raw_query);
+    defer highlighter_cfg.destroy();
+    var highlighter = try highlighter_cfg.highlight(contents, null);
+    const highlight_iter = highlighter.iter();
+    defer highlight_iter.destroy();
+
 
     var buf: [1024]u8 = undefined;
     var writer = std.fs.File.stdout().writer(&buf);
     const out = &writer.interface;
 
-    try default.renderTerminal(contents, out, highlighter, default.std_name_map.terminal_code_map, .{});
+    try default.renderTerminal(HighlightT, contents, out, highlight_iter, default.std_name_map.terminal_code_map);
 }
 
 test "simple test" {

@@ -164,10 +164,10 @@ pub fn renderHTML(source: []const u8, out: *std.io.Writer, highlighter: anytype,
     }
 }
 
-pub fn renderTerminal(source: []const u8, out: *std.io.Writer, highlighter: anytype, code_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
-    var iter = try highlighter.highlightLines(source, opts.base_tree);
-    defer iter.destroy();
-    while (try iter.next()) |event| {
+pub fn renderTerminal(Highlight: type, source: []const u8, out: *std.io.Writer, highlighter: EventIteratorT(HighlightEventT(Highlight)), code_map: std.EnumMap(Highlight, []const u8)) !void {
+    var delim_iter = HighlightDelimitedIterator(Highlight).init('\n', highlighter, source);
+    defer delim_iter.destroy();
+    while (try delim_iter.next()) |event| {
         switch (event) {
             .Source => |range| {
                 try out.print("{s}", .{source[range.start..range.end]});
@@ -329,12 +329,12 @@ pub fn EventIteratorT(EventT: type) type {
             };
         }
 
-        fn next(self: @This()) !?EventT {
+        pub fn next(self: @This()) !?EventT {
             // TODO: test passing self to check for errors
             return self.nextFn(self.ptr);
         }
 
-        fn destroy(self: @This()) void {
+        pub fn destroy(self: @This()) void {
             return self.destroyFn(self.ptr);
         }
     };
@@ -463,7 +463,7 @@ test "StaticHighlighter" {
     }
 }
 
-pub fn HighlightDelimitedIterator(Highlight: type, BaseIteratorT: type) type {
+pub fn HighlightDelimitedIterator(Highlight: type) type {
     const HighlightDelimitedEvent = HighlightDelimitedEventT(Highlight);
     const HighlightEvent = HighlightEventT(Highlight);
 
@@ -471,7 +471,7 @@ pub fn HighlightDelimitedIterator(Highlight: type, BaseIteratorT: type) type {
         const Self = @This();
 
         delimiter: u8,
-        base_iterator: BaseIteratorT,
+        base_iterator: EventIteratorT(HighlightEventT(Highlight)),
         source: []const u8,
 
         current_highlight: ?Highlight = null,
@@ -481,7 +481,7 @@ pub fn HighlightDelimitedIterator(Highlight: type, BaseIteratorT: type) type {
         in_a_line: bool = false,
         did_emit: bool = false,
 
-        pub fn init(delimiter: u8, base_iterator: BaseIteratorT, source: []const u8) Self {
+        pub fn init(delimiter: u8, base_iterator: EventIteratorT(HighlightEventT(Highlight)), source: []const u8) Self {
             return Self{
                 .delimiter = delimiter,
                 .base_iterator = base_iterator,
@@ -585,7 +585,7 @@ pub fn HighlightDelimitedIterator(Highlight: type, BaseIteratorT: type) type {
                     .Source => |range| {
                         return self.emitEvent(try self.handleSource(range));
                     },
-                    else => return self.emitEvent(HighlightDelimitedIterator(Highlight, BaseIteratorT).transformEvent(event)),
+                    else => return self.emitEvent(HighlightDelimitedIterator(Highlight).transformEvent(event)),
                 }
             }
 
@@ -596,8 +596,8 @@ pub fn HighlightDelimitedIterator(Highlight: type, BaseIteratorT: type) type {
             return self.emitEvent(null);
         }
 
-        pub fn destroy(self: *Self) void {
-            self.base_iterator.destroy();
+        pub fn destroy(_: *Self) void {
+            // Nothing to free
         }
     };
 }
@@ -693,7 +693,7 @@ pub fn createHighlighterConfig(HighlightT: type) type {
 
                     // Unreachable because every possible capture should have been collected and added to the capture_map in `create`
                     const current_highlight = self.highlighter.capture_map.get(capture.index) orelse {
-                        std.debug.print("Unrecognized capture index: {d} in map of length {d}", .{capture.index, self.highlighter.capture_map.count()});
+                        std.debug.print("Unrecognized capture index: {d} in map of length {d}", .{ capture.index, self.highlighter.capture_map.count() });
                         unreachable;
                     };
 
@@ -771,13 +771,13 @@ pub fn createHighlighterConfig(HighlightT: type) type {
             };
         }
 
-        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightDelimitedIterator(HighlightT, HighlightEventIterator) {
+        pub fn highlightLines(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree) !HighlightDelimitedIterator(HighlightT) {
             return self.highlightDelimited(source, tree, '\n');
         }
 
-        pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator(HighlightT, HighlightEventIterator) {
+        pub fn highlightDelimited(self: HighlighterSelf, source: []const u8, tree: ?*ts.Tree, delimiter: u8) !HighlightDelimitedIterator(HighlightT) {
             const highlighter = try self.highlight(source, tree);
-            return HighlightDelimitedIterator(HighlightT, HighlightEventIterator).init(
+            return HighlightDelimitedIterator(HighlightT).init(
                 delimiter,
                 highlighter,
                 source,
