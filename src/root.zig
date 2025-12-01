@@ -229,35 +229,55 @@ pub const HighlightRange = struct {
 // Combine two iterators, where iter_a always has priority over iter_b. That is, for regions where highlights from
 // iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
 // iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Does not allocate.
-// pub fn combineIterators(HighlightT: type, iter_a: EventIteratorT(HighlightT), iter_b: EventIteratorT(HighlightT)) !HighlightEventIteratorT(HighlightT) {
-//     const IterState = struct {
-//         cur_highlight: ?HighlightT = null,
-//         next_highlight: ?HighlightT = null,
-//         cur_range: ?HighlightRange = null,
-//         next_range: ?HighlightRange = null,
-//     };
-//
-//     var a_state = IterState{};
-//     var b_state = IterState{};
-//
-//     _ = iter_a.next();
-//
-//     // if it is a highlight event, then emit right away
-//
-//     _ = a_state;
-//     _ = b_state;
-//
-//     while (a_state.cur_range == null) {
-//
-//     }
-//
-//     return struct {
-//         const Self = @This();
-//         pub fn next(self: Self) !?HighlightT {
-//
-//         }
-//     };
-// }
+pub fn IteratorCombination(Highlight: type) type {
+    const IterT = EventIteratorT(HighlightEventT(Highlight));
+
+    const IterState = struct {
+        iterator: IterT,
+        cur_highlight: ?Highlight = null,
+        next_highlight: ?Highlight = null,
+        cur_range: ?HighlightRange = null,
+        next_range: ?HighlightRange = null,
+    };
+
+    return struct {
+        const Self = @This();
+        a_state: IterState,
+        b_state: IterState,
+
+        pub fn init(iter_a: IterT, iter_b: IterT) Self {
+            return Self{
+                .a_state = IterState{ .iterator = iter_a },
+                .b_state = IterState{ .iterator = iter_b },
+            };
+        }
+
+        pub fn iter(self: *Self) EventIteratorT(HighlightEventT(Highlight)) {
+            return EventIteratorT(HighlightEventT(Highlight)).init(self);
+        }
+
+        pub fn next(self: *Self) !?HighlightEventT(Highlight) {
+            if (self.a_state.cur_range == null and self.b_state.cur_range == null) {
+                if (try self.a_state.iterator.next()) |a_next| {
+                    switch (a_next) {
+                        .Source => |range| {
+                            self.a_state.cur_range = range;
+                        },
+                        .HighlightStart => |hl| {
+                            self.a_state.cur_highlight = hl;
+                            return hl;
+                        },
+                        .HighlightEnd => {
+                            // Would mean that we do a highlight start, and then end with no source
+                            // in between.
+                            unreachable;
+                        },
+                    }
+                }
+            }
+        }
+    };
+}
 
 pub fn HighlightEventT(HighlightT: type) type {
     return union(enum) {
@@ -450,6 +470,46 @@ test "StaticHighlighter" {
             unreachable;
         }
     }
+}
+
+fn testIteratorCombination(Highlight: type, source: []const u8, a_ranges: []const HighlightRange, b_ranges: []const HighlightRange, expected_events: []const HighlightEventT(Highlight)) !void {
+    var a_range_iter = StaticIterator(HighlightRange).init(a_ranges[0..]);
+    var a_static_highlighter = StaticHighlighter(Highlight).init(source, a_range_iter.iter(), .@"function.method");
+
+    var b_range_iter = StaticIterator(HighlightRange).init(b_ranges[0..]);
+    var b_static_highlighter = StaticHighlighter(Highlight).init(source, b_range_iter.iter(), .@"function.method");
+
+    var combo = IteratorCombination(Highlight).init(a_static_highlighter.iter(), b_static_highlighter.iter());
+    const combo_highlighter = combo.iter();
+
+    for (expected_events) |expected| {
+        const highlight_event = try combo_highlighter.next();
+        if (highlight_event) |actual| {
+            try std.testing.expectEqualDeep(expected, actual);
+        } else {
+            unreachable;
+        }
+    }
+}
+
+test "Basic Combination" {
+    const Highlight = createEnum(&std_names);
+    const highlight = .@"function.method";
+    const EventT = HighlightEventT(Highlight);
+    const source = "abckdfjsl3hdlzn";
+
+    const a_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
+    const b_ranges = [_]HighlightRange{};
+
+    const expected_events = [_]EventT{
+        EventT{ .Source = .{ .start = 0, .end = 5 } },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 5, .end = 7 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .Source = .{ .start = 7, .end = source.len } },
+    };
+
+    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
 }
 
 pub fn HighlightDelimitedIterator(Highlight: type) type {
