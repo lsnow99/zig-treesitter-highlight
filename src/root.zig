@@ -247,42 +247,40 @@ pub fn IteratorCombination(Highlight: type) type {
         const Self = @This();
         iterator: IterT,
         cur_range: ?ValuedHighlightRange = null,
-        next_events: ComptimeBufferedQueue(HighlightEventT(Highlight), 3),
 
-        fn updateRange(self: *Self, start_ix: u64) void {
+        fn updateRange(self: *Self, start_ix: u64) !void {
             if (self.cur_range) |range| {
-                return range;
+                if (range.range.end > start_ix) {
+                    // Clamp the start index
+                    self.cur_range.?.range.start = start_ix;
+                    return;
+                }
             }
 
             var cur_hl: ?Highlight = null;
-            while (self.iterator.next()) |evt| {
+            while (try self.iterator.next()) |evt| {
                 switch (evt) {
                     .HighlightStart => |hl| {
                         cur_hl = hl;
                     },
                     .Source => |range| {
-                        if (range.end > start_ix) {
-                            self.cur_range = .{
-                                // Must have first hit a HighlightStart
-                                .highlight = cur_hl.?,
-                                .range = .{ .start = start_ix, .end = range.end },
-                            };
+                        if (cur_hl) |hl| {
+                            if (range.end > start_ix) {
+                                self.cur_range = .{
+                                    .highlight = hl,
+                                    .range = .{ .start = @max(start_ix, range.start), .end = range.end },
+                                };
+                                return;
+                            }
                         }
                     },
-                    .HighlightEnd => {},
+                    .HighlightEnd => {
+                        cur_hl = null;
+                    },
                 }
             }
-        }
 
-        fn consumeTo(self: *Self, clamp_end_ix: u64) void {
-            if (self.cur_range) |v_range| {
-                if (clamp_end_ix >= v_range.range.end) {
-                    const emitted_range = .{ .start = v_range.range.start, .end = @min(clamp_end_ix, v_range.range.end) };
-                    if (emitted_range.end < clamp_end_ix) {
-                        self.cur_range = .{.highlight = v_range.highlight, .range = .{ .start = 
-                    }
-                }
-            }
+            self.cur_range = null;
         }
     };
 
@@ -291,13 +289,17 @@ pub fn IteratorCombination(Highlight: type) type {
         a_state: IterState,
         b_state: IterState,
         cur_ix: u64 = 0,
-        cur_range: PrioritizedHighlightRange,
-        next_events: ComptimeBufferedQueue(HighlightEventT(Highlight), 10),
+        next_events: ComptimeBufferedQueue(HighlightEventT(Highlight), 2),
+        first_event: ?HighlightEventT(Highlight) = null,
+        second_event: ?HighlightEventT(Highlight) = null,
+        source: []const u8,
 
-        pub fn init(iter_a: IterT, iter_b: IterT) Self {
+        pub fn init(source: []const u8, iter_a: IterT, iter_b: IterT) Self {
             return Self{
                 .a_state = IterState{ .iterator = iter_a },
                 .b_state = IterState{ .iterator = iter_b },
+                .source = source,
+                .next_events = ComptimeBufferedQueue(HighlightEventT(Highlight), 2){},
             };
         }
 
@@ -316,55 +318,55 @@ pub fn IteratorCombination(Highlight: type) type {
         }
 
         pub fn next(self: *Self) !?HighlightEventT(Highlight) {
-            while (self.next_events.dequeue()) |evt| {
+            if (self.first_event) |evt| {
+                self.first_event = null;
+                return self.emitEvent(evt);
+            }
+            if (self.second_event) |evt| {
+                self.second_event = null;
                 return self.emitEvent(evt);
             }
 
-            self.a_state.updateRange(self.cur_ix);
-            self.b_state.updateRange(self.cur_ix);
-
-            if (self.a_state.iterator.next()) |start_evt| {
-                const src_evt = self.a_state.iterator.next().?;
-                const end_ix = switch (src_evt) {
-                    .Source => |range| range.end,
-                    else => unreachable,
-                };
-                const end_evt = self.a_state.iterator.next().?;
-
-                self.next_events.enqueue(start_evt);
-                self.next_events.enqueue(src_evt);
-                self.next_events.enqueue(end_evt);
-            } else {
-                return self.b_state.iterator.next();
-            }
+            try self.a_state.updateRange(self.cur_ix);
+            try self.b_state.updateRange(self.cur_ix);
 
             if (self.a_state.cur_range) |a_range| {
-                self.cur_ix = a_range.end;
-                self.a_state.cur_range = null;
-                if (self.a_state.cur_highlight) |_| {
-                    self.next_event = .{ .HighlightEnd = {} };
-                }
-                return .{ .Source = .{ .start = self.cur_ix, .end = a_range.end } };
-            }
-            if (self.b_state.cur_range) |b_range| {}
-            if (self.a_state.cur_range == null and self.b_state.cur_range == null) {
-                if (try self.a_state.iterator.next()) |a_next| {
-                    switch (a_next) {
-                        .Source => |range| {
-                            self.a_state.cur_range = range;
-                            return a_next;
-                        },
-                        .HighlightStart => |hl| {
-                            self.a_state.cur_highlight = hl;
-                            return a_next;
-                        },
-                        .HighlightEnd => {
-                            // Would mean that we do a highlight start, and then end with no source
-                            // in between.
-                            unreachable;
-                        },
+                if (self.b_state.cur_range) |b_range| {
+                    const first = @min(a_range.range.start, b_range.range.start);
+                    if (self.cur_ix < first) {
+                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = first } });
                     }
+                    if (b_range.range.start < a_range.range.start) {
+                        assert(b_range.range.start == self.cur_ix);
+                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = @min(a_range.range.start, b_range.range.end) } };
+                        self.second_event = .{ .HighlightEnd = {} };
+                        return self.emitEvent(.{ .HighlightStart = b_range.highlight });
+                    } else {
+                        assert(a_range.range.start == self.cur_ix);
+                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
+                        self.second_event = .{ .HighlightEnd = {} };
+                        return self.emitEvent(.{ .HighlightStart = a_range.highlight });
+                    }
+                } else {
+                    if (self.cur_ix < a_range.range.start) {
+                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = a_range.range.start } });
+                    }
+                    assert(a_range.range.start == self.cur_ix);
+                    self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
+                    self.second_event = .{ .HighlightEnd = {} };
+                    return self.emitEvent(.{ .HighlightStart = a_range.highlight });
                 }
+            } else if (self.b_state.cur_range) |b_range| {
+                if (self.cur_ix < b_range.range.start) {
+                    return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = b_range.range.start } });
+                }
+                assert(b_range.range.start == self.cur_ix);
+                self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = b_range.range.end } };
+                self.second_event = .{ .HighlightEnd = {} };
+                return self.emitEvent(.{ .HighlightStart = b_range.highlight });
+            } else {
+                // Flush to end
+                return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = self.source.len } });
             }
         }
     };
@@ -570,12 +572,13 @@ fn testIteratorCombination(Highlight: type, source: []const u8, a_ranges: []cons
     var b_range_iter = StaticIterator(HighlightRange).init(b_ranges[0..]);
     var b_static_highlighter = StaticHighlighter(Highlight).init(source, b_range_iter.iter(), .@"function.method");
 
-    var combo = IteratorCombination(Highlight).init(a_static_highlighter.iter(), b_static_highlighter.iter());
+    var combo = IteratorCombination(Highlight).init(source, a_static_highlighter.iter(), b_static_highlighter.iter());
     const combo_highlighter = combo.iter();
 
     for (expected_events) |expected| {
         const highlight_event = try combo_highlighter.next();
         if (highlight_event) |actual| {
+            std.debug.print("\nTesting actual {any} vs expected {any} {d}\n", .{actual, expected, combo.cur_ix});
             try std.testing.expectEqualDeep(expected, actual);
         } else {
             unreachable;
@@ -598,6 +601,52 @@ test "Basic Combination" {
         EventT{ .Source = .{ .start = 5, .end = 7 } },
         EventT{ .HighlightEnd = {} },
         EventT{ .Source = .{ .start = 7, .end = source.len } },
+    };
+
+    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
+}
+
+test "Back Overlapping Combination" {
+    const Highlight = createEnum(&std_names);
+    const highlight = .@"function.method";
+    const EventT = HighlightEventT(Highlight);
+    const source = "abckdfjsl3hdlzn";
+
+    const a_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
+    const b_ranges = [_]HighlightRange{.{ .start = 6, .end = 8 }};
+
+    const expected_events = [_]EventT{
+        EventT{ .Source = .{ .start = 0, .end = 5 } },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 5, .end = 7 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 7, .end = 8 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .Source = .{ .start = 8, .end = source.len } },
+    };
+
+    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
+}
+
+test "Front Overlapping Combination" {
+    const Highlight = createEnum(&std_names);
+    const highlight = .@"function.method";
+    const EventT = HighlightEventT(Highlight);
+    const source = "abckdfjsl3hdlzn";
+
+    const a_ranges = [_]HighlightRange{.{ .start = 6, .end = 8 }};
+    const b_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
+
+    const expected_events = [_]EventT{
+        EventT{ .Source = .{ .start = 0, .end = 5 } },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 5, .end = 6 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .HighlightStart = highlight },
+        EventT{ .Source = .{ .start = 6, .end = 8 } },
+        EventT{ .HighlightEnd = {} },
+        EventT{ .Source = .{ .start = 8, .end = source.len } },
     };
 
     try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);

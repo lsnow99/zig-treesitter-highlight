@@ -24,7 +24,7 @@ pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) ty
     return struct {
         const Self = @This();
 
-        buffer: [buffer_size]?Child = [buffer_size]?Child{},
+        buffer: [buffer_size]?Child = undefined,
         start: usize = 0,
         len: usize = 0,
 
