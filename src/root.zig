@@ -1,8 +1,13 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
+const assert = std.debug.assert;
+const print = std.debug.print;
 const ts = @import("tree-sitter");
 const Queue = @import("queue.zig").Queue;
 const ComptimeBufferedQueue = @import("queue.zig").ComptimeBufferedQueue;
+const util = @import("util.zig");
+
+pub const IteratorCombinator = @import("combinator.zig").IteratorCombinator;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
@@ -10,8 +15,6 @@ const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQ
 
 const std_lines = splitComptime(@embedFile("standard_names"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
-
-const std_names = [_][]const u8{ "function.method", "" };
 
 pub fn filterNonNullComptime(T: type, values: []const ?T) []const T {
     var filtered: []const T = &[_]T{};
@@ -226,39 +229,6 @@ pub const HighlightRange = struct {
     end: usize,
 };
 
-// Combine two iterators, where iter_a always has priority over iter_b. That is, for regions where highlights from
-// iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
-// iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Does not allocate.
-// pub fn combineIterators(HighlightT: type, iter_a: EventIteratorT(HighlightT), iter_b: EventIteratorT(HighlightT)) !HighlightEventIteratorT(HighlightT) {
-//     const IterState = struct {
-//         cur_highlight: ?HighlightT = null,
-//         next_highlight: ?HighlightT = null,
-//         cur_range: ?HighlightRange = null,
-//         next_range: ?HighlightRange = null,
-//     };
-//
-//     var a_state = IterState{};
-//     var b_state = IterState{};
-//
-//     _ = iter_a.next();
-//
-//     // if it is a highlight event, then emit right away
-//
-//     _ = a_state;
-//     _ = b_state;
-//
-//     while (a_state.cur_range == null) {
-//
-//     }
-//
-//     return struct {
-//         const Self = @This();
-//         pub fn next(self: Self) !?HighlightT {
-//
-//         }
-//     };
-// }
-
 pub fn HighlightEventT(HighlightT: type) type {
     return union(enum) {
         Source: HighlightRange,
@@ -305,7 +275,7 @@ pub fn EventIteratorT(EventT: type) type {
         ptr: *anyopaque,
         nextFn: *const fn (ptr: *anyopaque) anyerror!?EventT,
 
-        fn init(ptr: anytype) @This() {
+        pub fn init(ptr: anytype) @This() {
             const T = @TypeOf(ptr);
             const ptr_info = @typeInfo(T);
 
@@ -426,7 +396,7 @@ pub fn StaticIterator(EventT: type) type {
 }
 
 test "StaticHighlighter" {
-    const Highlight = createEnum(&std_names);
+    const Highlight = util.TestHighlight;
     const highlight = .@"function.method";
     const source = "abckdfjsl3hdlzn";
     const ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
@@ -940,7 +910,7 @@ test "createEnum" {
 }
 
 test "basic matchName" {
-    const HighlightEnum = createEnum(&std_names);
+    const HighlightEnum = util.TestHighlight;
     try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
 }
 
@@ -987,4 +957,8 @@ test "basic expand" {
     try std.testing.expect(std.mem.eql(u8, foo, "foo"));
     try std.testing.expect(std.mem.eql(u8, bar, "bar"));
     try std.testing.expect(std.mem.eql(u8, baz, "baz"));
+}
+
+test "combinators" {
+    _ = @import("combinator.zig");
 }

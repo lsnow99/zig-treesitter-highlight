@@ -26,7 +26,6 @@ fn buildGrammar(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolve
     }
 }
 
-
 const TreesitterGrammar = union(enum) {
     C: TreesitterCGrammar,
     CPP: TreesitterCPPGrammar,
@@ -43,7 +42,6 @@ const TreesitterCGrammar = struct {
 const TreesitterCPPGrammar = struct {
     // Unimplemented
 };
-
 
 // Although this function looks imperative, it does not perform the build
 // directly and instead it mutates the build graph (`b`) that will be then
@@ -137,7 +135,7 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("tree-sitter", tree_sitter.module("tree_sitter"));
 
-    const grammars = [_]TreesitterGrammar{ TreesitterGrammar{ .C = .{ .mod_name = "tree-sitter-python", .dep_name = "tree_sitter_python" } } };
+    const grammars = [_]TreesitterGrammar{TreesitterGrammar{ .C = .{ .mod_name = "tree-sitter-python", .dep_name = "tree_sitter_python" } }};
     for (grammars) |grammar| {
         buildGrammar(b, exe.root_module, target, optimize, grammar);
     }
