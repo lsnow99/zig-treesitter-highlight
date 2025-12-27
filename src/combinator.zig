@@ -16,8 +16,13 @@ pub fn IteratorCombinator(Highlight: type) type {
     const IterT = EventIteratorT(HighlightEventT(Highlight));
 
     const ValuedHighlightRange = struct {
-        range: HighlightRange,
+        start: u64,
+        end: u64,
         highlight: Highlight,
+
+        pub fn asRange(self: @This()) HighlightRange {
+            return HighlightRange{.start = self.start, .end = self.end};
+        }
     };
 
     const IterState = struct {
@@ -27,9 +32,9 @@ pub fn IteratorCombinator(Highlight: type) type {
 
         fn updateRange(self: *Self, start_ix: u64) !void {
             if (self.cur_range) |range| {
-                if (range.range.end > start_ix) {
+                if (range.end > start_ix) {
                     // Clamp the start index
-                    self.cur_range.?.range.start = @max(start_ix, range.range.start);
+                    self.cur_range.?.start = @max(start_ix, range.start);
                     return;
                 }
             }
@@ -45,7 +50,8 @@ pub fn IteratorCombinator(Highlight: type) type {
                             if (range.end > start_ix) {
                                 self.cur_range = .{
                                     .highlight = hl,
-                                    .range = .{ .start = @max(start_ix, range.start), .end = range.end },
+                                    .start = @max(start_ix, range.start), 
+                                    .end = range.end,
                                 };
                                 return;
                             }
@@ -92,16 +98,17 @@ pub fn IteratorCombinator(Highlight: type) type {
             return evt;
         }
 
-        pub fn printState(self: *Self) void {
-            std.debug.print("CURRENT STATE: {any}\n", .{self});
+        fn emitHighlight(self: *Self, highlight: Highlight, end: u64) ?HighlightEventT(Highlight) {
+            assert(self.first_event == null);
+            assert(self.second_event == null);
+            self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = end } };
+            self.second_event = .{ .HighlightEnd = {} };
+            return self.emitEvent(.{ .HighlightStart = highlight });
         }
 
         pub fn next(self: *Self) !?HighlightEventT(Highlight) {
             if (self.first_event) |evt| {
-                self.first_event = null;
-                return self.emitEvent(evt);
-            }
-            if (self.second_event) |evt| {
+                self.first_event = self.second_event;
                 self.second_event = null;
                 return self.emitEvent(evt);
             }
@@ -111,49 +118,32 @@ pub fn IteratorCombinator(Highlight: type) type {
 
             if (self.a_state.cur_range) |a_range| {
                 if (self.b_state.cur_range) |b_range| {
-                    const first = @min(a_range.range.start, b_range.range.start);
+                    const first = @min(a_range.start, b_range.start);
                     if (self.cur_ix < first) {
-                        dbg("flushing1");
                         return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = first } });
                     }
-                    print("FLUSEHD TO: {d}. A START: {d}, B START: {d}\n", .{ first, a_range.range.start, b_range.range.start });
-                    if (b_range.range.start < a_range.range.start) {
-                        assert(b_range.range.start == self.cur_ix);
-                        dbg("bfirst");
-                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = @min(a_range.range.start, b_range.range.end) } };
-                        self.second_event = .{ .HighlightEnd = {} };
-                        return self.emitEvent(.{ .HighlightStart = b_range.highlight });
+                    if (b_range.start < a_range.start) {
+                        assert(b_range.start == self.cur_ix);
+                        return self.emitHighlight(b_range.highlight, @min(a_range.start, b_range.end));
                     } else {
-                        assert(a_range.range.start == self.cur_ix);
-                        dbg("thena");
-                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
-                        self.second_event = .{ .HighlightEnd = {} };
-                        return self.emitEvent(.{ .HighlightStart = a_range.highlight });
+                        assert(a_range.start == self.cur_ix);
+                        return self.emitHighlight(a_range.highlight, a_range.end);
                     }
                 } else {
-                    if (self.cur_ix < a_range.range.start) {
-                        dbg("flushing2");
-                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = a_range.range.start } });
+                    if (self.cur_ix < a_range.start) {
+                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = a_range.start } });
                     }
-                    assert(a_range.range.start == self.cur_ix);
-                    dbg("ora");
-                    self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
-                    self.second_event = .{ .HighlightEnd = {} };
-                    return self.emitEvent(.{ .HighlightStart = a_range.highlight });
+                    assert(a_range.start == self.cur_ix);
+                    return self.emitHighlight(a_range.highlight, a_range.end);
                 }
             } else if (self.b_state.cur_range) |b_range| {
-                if (self.cur_ix < b_range.range.start) {
-                    dbg("flushing3");
-                    return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = b_range.range.start } });
+                if (self.cur_ix < b_range.start) {
+                    return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = b_range.start } });
                 }
-                assert(b_range.range.start == self.cur_ix);
-                dbg("elseb");
-                self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = b_range.range.end } };
-                self.second_event = .{ .HighlightEnd = {} };
-                return self.emitEvent(.{ .HighlightStart = b_range.highlight });
+                assert(b_range.start == self.cur_ix);
+                return self.emitHighlight(b_range.highlight, b_range.end);
             } else {
                 // Flush to end
-                dbg("flushing4");
                 return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = self.source.len } });
             }
         }
@@ -181,8 +171,6 @@ fn testIteratorCombinator(
     for (expected_events) |expected| {
         const highlight_event = try combo_highlighter.next();
         if (highlight_event) |actual| {
-            // combo.printState();
-            std.debug.print("\nTesting actual {any} vs expected {any} {d}\n", .{ actual, expected, combo.cur_ix });
             try std.testing.expectEqualDeep(expected, actual);
         } else {
             unreachable;
