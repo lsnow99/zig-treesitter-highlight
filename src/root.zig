@@ -1,9 +1,13 @@
 //! By convention, root.zig is the root source file when making a library.
 const std = @import("std");
 const assert = std.debug.assert;
+const print = std.debug.print;
 const ts = @import("tree-sitter");
 const Queue = @import("queue.zig").Queue;
 const ComptimeBufferedQueue = @import("queue.zig").ComptimeBufferedQueue;
+const util = @import("util.zig");
+
+pub const IteratorCombinator = @import("combinator.zig").IteratorCombinator;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
@@ -11,8 +15,6 @@ const Error = error{ Cancelled, InvalidLanguage, Unknown, ParseFailure, InvalidQ
 
 const std_lines = splitComptime(@embedFile("standard_names"), '\n');
 const python_highlight = @embedFile("python_highlight.scm");
-
-const std_names = [_][]const u8{ "function.method", "" };
 
 pub fn filterNonNullComptime(T: type, values: []const ?T) []const T {
     var filtered: []const T = &[_]T{};
@@ -232,146 +234,6 @@ const PrioritizedHighlightRange = union(enum) {
     Lower: HighlightRange,
 };
 
-// Combine two iterators, where iter_a always has priority over iter_b. That is, for regions where highlights from
-// iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
-// iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Does not allocate.
-pub fn IteratorCombination(Highlight: type) type {
-    const IterT = EventIteratorT(HighlightEventT(Highlight));
-
-    const ValuedHighlightRange = struct {
-        range: HighlightRange,
-        highlight: Highlight,
-    };
-
-    const IterState = struct {
-        const Self = @This();
-        iterator: IterT,
-        cur_range: ?ValuedHighlightRange = null,
-
-        fn updateRange(self: *Self, start_ix: u64) !void {
-            if (self.cur_range) |range| {
-                if (range.range.end > start_ix) {
-                    // Clamp the start index
-                    self.cur_range.?.range.start = start_ix;
-                    return;
-                }
-            }
-
-            var cur_hl: ?Highlight = null;
-            while (try self.iterator.next()) |evt| {
-                switch (evt) {
-                    .HighlightStart => |hl| {
-                        cur_hl = hl;
-                    },
-                    .Source => |range| {
-                        if (cur_hl) |hl| {
-                            if (range.end > start_ix) {
-                                self.cur_range = .{
-                                    .highlight = hl,
-                                    .range = .{ .start = @max(start_ix, range.start), .end = range.end },
-                                };
-                                return;
-                            }
-                        }
-                    },
-                    .HighlightEnd => {
-                        cur_hl = null;
-                    },
-                }
-            }
-
-            self.cur_range = null;
-        }
-    };
-
-    return struct {
-        const Self = @This();
-        a_state: IterState,
-        b_state: IterState,
-        cur_ix: u64 = 0,
-        next_events: ComptimeBufferedQueue(HighlightEventT(Highlight), 2),
-        first_event: ?HighlightEventT(Highlight) = null,
-        second_event: ?HighlightEventT(Highlight) = null,
-        source: []const u8,
-
-        pub fn init(source: []const u8, iter_a: IterT, iter_b: IterT) Self {
-            return Self{
-                .a_state = IterState{ .iterator = iter_a },
-                .b_state = IterState{ .iterator = iter_b },
-                .source = source,
-                .next_events = ComptimeBufferedQueue(HighlightEventT(Highlight), 2){},
-            };
-        }
-
-        pub fn iter(self: *Self) EventIteratorT(HighlightEventT(Highlight)) {
-            return EventIteratorT(HighlightEventT(Highlight)).init(self);
-        }
-
-        fn emitEvent(self: *Self, evt: HighlightEventT(Highlight)) HighlightEventT(Highlight) {
-            switch (evt) {
-                .Source => |range| {
-                    self.cur_ix = range.end;
-                },
-                else => {},
-            }
-            return evt;
-        }
-
-        pub fn next(self: *Self) !?HighlightEventT(Highlight) {
-            if (self.first_event) |evt| {
-                self.first_event = null;
-                return self.emitEvent(evt);
-            }
-            if (self.second_event) |evt| {
-                self.second_event = null;
-                return self.emitEvent(evt);
-            }
-
-            try self.a_state.updateRange(self.cur_ix);
-            try self.b_state.updateRange(self.cur_ix);
-
-            if (self.a_state.cur_range) |a_range| {
-                if (self.b_state.cur_range) |b_range| {
-                    const first = @min(a_range.range.start, b_range.range.start);
-                    if (self.cur_ix < first) {
-                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = first } });
-                    }
-                    if (b_range.range.start < a_range.range.start) {
-                        assert(b_range.range.start == self.cur_ix);
-                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = @min(a_range.range.start, b_range.range.end) } };
-                        self.second_event = .{ .HighlightEnd = {} };
-                        return self.emitEvent(.{ .HighlightStart = b_range.highlight });
-                    } else {
-                        assert(a_range.range.start == self.cur_ix);
-                        self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
-                        self.second_event = .{ .HighlightEnd = {} };
-                        return self.emitEvent(.{ .HighlightStart = a_range.highlight });
-                    }
-                } else {
-                    if (self.cur_ix < a_range.range.start) {
-                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = a_range.range.start } });
-                    }
-                    assert(a_range.range.start == self.cur_ix);
-                    self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = a_range.range.end } };
-                    self.second_event = .{ .HighlightEnd = {} };
-                    return self.emitEvent(.{ .HighlightStart = a_range.highlight });
-                }
-            } else if (self.b_state.cur_range) |b_range| {
-                if (self.cur_ix < b_range.range.start) {
-                    return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = b_range.range.start } });
-                }
-                assert(b_range.range.start == self.cur_ix);
-                self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = b_range.range.end } };
-                self.second_event = .{ .HighlightEnd = {} };
-                return self.emitEvent(.{ .HighlightStart = b_range.highlight });
-            } else {
-                // Flush to end
-                return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = self.source.len } });
-            }
-        }
-    };
-}
-
 pub fn HighlightEventT(HighlightT: type) type {
     return union(enum) {
         Source: HighlightRange,
@@ -418,7 +280,7 @@ pub fn EventIteratorT(EventT: type) type {
         ptr: *anyopaque,
         nextFn: *const fn (ptr: *anyopaque) anyerror!?EventT,
 
-        fn init(ptr: anytype) @This() {
+        pub fn init(ptr: anytype) @This() {
             const T = @TypeOf(ptr);
             const ptr_info = @typeInfo(T);
 
@@ -539,7 +401,7 @@ pub fn StaticIterator(EventT: type) type {
 }
 
 test "StaticHighlighter" {
-    const Highlight = createEnum(&std_names);
+    const Highlight = util.TestHighlight;
     const highlight = .@"function.method";
     const source = "abckdfjsl3hdlzn";
     const ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
@@ -563,93 +425,6 @@ test "StaticHighlighter" {
             unreachable;
         }
     }
-}
-
-fn testIteratorCombination(Highlight: type, source: []const u8, a_ranges: []const HighlightRange, b_ranges: []const HighlightRange, expected_events: []const HighlightEventT(Highlight)) !void {
-    var a_range_iter = StaticIterator(HighlightRange).init(a_ranges[0..]);
-    var a_static_highlighter = StaticHighlighter(Highlight).init(source, a_range_iter.iter(), .@"function.method");
-
-    var b_range_iter = StaticIterator(HighlightRange).init(b_ranges[0..]);
-    var b_static_highlighter = StaticHighlighter(Highlight).init(source, b_range_iter.iter(), .@"function.method");
-
-    var combo = IteratorCombination(Highlight).init(source, a_static_highlighter.iter(), b_static_highlighter.iter());
-    const combo_highlighter = combo.iter();
-
-    for (expected_events) |expected| {
-        const highlight_event = try combo_highlighter.next();
-        if (highlight_event) |actual| {
-            std.debug.print("\nTesting actual {any} vs expected {any} {d}\n", .{actual, expected, combo.cur_ix});
-            try std.testing.expectEqualDeep(expected, actual);
-        } else {
-            unreachable;
-        }
-    }
-}
-
-test "Basic Combination" {
-    const Highlight = createEnum(&std_names);
-    const highlight = .@"function.method";
-    const EventT = HighlightEventT(Highlight);
-    const source = "abckdfjsl3hdlzn";
-
-    const a_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
-    const b_ranges = [_]HighlightRange{};
-
-    const expected_events = [_]EventT{
-        EventT{ .Source = .{ .start = 0, .end = 5 } },
-        EventT{ .HighlightStart = highlight },
-        EventT{ .Source = .{ .start = 5, .end = 7 } },
-        EventT{ .HighlightEnd = {} },
-        EventT{ .Source = .{ .start = 7, .end = source.len } },
-    };
-
-    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
-}
-
-test "Back Overlapping Combination" {
-    const Highlight = createEnum(&std_names);
-    const highlight = .@"function.method";
-    const EventT = HighlightEventT(Highlight);
-    const source = "abckdfjsl3hdlzn";
-
-    const a_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
-    const b_ranges = [_]HighlightRange{.{ .start = 6, .end = 8 }};
-
-    const expected_events = [_]EventT{
-        EventT{ .Source = .{ .start = 0, .end = 5 } },
-        EventT{ .HighlightStart = highlight },
-        EventT{ .Source = .{ .start = 5, .end = 7 } },
-        EventT{ .HighlightEnd = {} },
-        EventT{ .HighlightStart = highlight },
-        EventT{ .Source = .{ .start = 7, .end = 8 } },
-        EventT{ .HighlightEnd = {} },
-        EventT{ .Source = .{ .start = 8, .end = source.len } },
-    };
-
-    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
-}
-
-test "Front Overlapping Combination" {
-    const Highlight = createEnum(&std_names);
-    const highlight = .@"function.method";
-    const EventT = HighlightEventT(Highlight);
-    const source = "abckdfjsl3hdlzn";
-
-    const a_ranges = [_]HighlightRange{.{ .start = 6, .end = 8 }};
-    const b_ranges = [_]HighlightRange{.{ .start = 5, .end = 7 }};
-
-    const expected_events = [_]EventT{
-        EventT{ .Source = .{ .start = 0, .end = 5 } },
-        EventT{ .HighlightStart = highlight },
-        EventT{ .Source = .{ .start = 5, .end = 6 } },
-        EventT{ .HighlightEnd = {} },
-        EventT{ .HighlightStart = highlight },
-        EventT{ .Source = .{ .start = 6, .end = 8 } },
-        EventT{ .HighlightEnd = {} },
-        EventT{ .Source = .{ .start = 8, .end = source.len } },
-    };
-
-    try testIteratorCombination(Highlight, source, &a_ranges, &b_ranges, &expected_events);
 }
 
 pub fn HighlightDelimitedIterator(Highlight: type) type {
@@ -1140,7 +915,7 @@ test "createEnum" {
 }
 
 test "basic matchName" {
-    const HighlightEnum = createEnum(&std_names);
+    const HighlightEnum = util.TestHighlight;
     try std.testing.expect(matchName(HighlightEnum, "function.method") != null);
 }
 
@@ -1187,4 +962,8 @@ test "basic expand" {
     try std.testing.expect(std.mem.eql(u8, foo, "foo"));
     try std.testing.expect(std.mem.eql(u8, bar, "bar"));
     try std.testing.expect(std.mem.eql(u8, baz, "baz"));
+}
+
+test "combinators" {
+    _ = @import("combinator.zig");
 }
