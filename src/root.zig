@@ -229,11 +229,6 @@ pub const HighlightRange = struct {
     end: usize,
 };
 
-const PrioritizedHighlightRange = union(enum) {
-    Higher: HighlightRange,
-    Lower: HighlightRange,
-};
-
 pub fn HighlightEventT(HighlightT: type) type {
     return union(enum) {
         Source: HighlightRange,
