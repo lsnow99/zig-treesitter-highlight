@@ -4,6 +4,7 @@ const EventIteratorT = @import("root.zig").EventIteratorT;
 const HighlightEventT = @import("root.zig").HighlightEventT;
 const StaticIterator = @import("root.zig").StaticIterator;
 const StaticHighlighter = @import("root.zig").StaticHighlighter;
+const RingBufferDeque = @import("queue.zig").RingBufferDeque;
 const dbg = @import("util.zig").dbg;
 const print = @import("std").debug.print;
 const assert = @import("std").debug.assert;
@@ -158,11 +159,13 @@ fn testIterator(
     iterator: EventIteratorT(HighlightEventT(Highlight)),
     expected_events: []const HighlightEventT(Highlight),
 ) !void {
-    for (expected_events) |expected| {
+    for (expected_events, 0..expected_events.len) |expected, i| {
         const highlight_event = try iterator.next();
         if (highlight_event) |actual| {
+            std.debug.print("testing index {d}\n", .{i});
             try std.testing.expectEqualDeep(expected, actual);
         } else {
+            std.debug.print("ran out of events at index {d}\n", .{i});
             unreachable;
         }
     }
@@ -205,9 +208,13 @@ fn testIteratorSum(
 ) !void {
     var iterators: [len]EventIteratorT(HighlightEventT(Highlight)) = undefined;
 
-    for (iterator_ranges,0..len) |iterator_range, i| {
+    for (iterator_ranges, 0..len) |iterator_range, i| {
         var highlighter = StaticIterator(HighlightRange).init(iterator_range.ranges);
-        var iterator = StaticHighlighter(Highlight).init(source, highlighter.iter(), iterator_range.highlight);
+        var iterator = StaticHighlighter(Highlight).init(
+            source,
+            highlighter.iter(),
+            iterator_range.highlight,
+        );
         iterators[i] = iterator.iter();
     }
 
@@ -234,7 +241,15 @@ test "Basic Combination" {
         EventT{ .Source = .{ .start = 7, .end = source.len } },
     };
 
-    try testIteratorOverride(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
+    try testIteratorOverride(
+        util.TestHighlight,
+        source,
+        a_highlight,
+        b_highlight,
+        &a_ranges,
+        &b_ranges,
+        &expected_events,
+    );
 }
 
 test "Back Overlapping Combination" {
@@ -430,17 +445,18 @@ pub fn IteratorCombinatorSum(Highlight: type, N: comptime_int) type {
 
     return struct {
         const Self = @This();
+
         states: [N]IterState,
-        cur_ix: u64 = 0,
-        first_event: ?HighlightEventT(Highlight) = null,
-        second_event: ?HighlightEventT(Highlight) = null,
         source: []const u8,
+        cur_ix: u64 = 0,
+        // Max 2 events per state at any given time + 1 for a Source event
+        deque: RingBufferDeque(HighlightEventT(Highlight), N * 2 + 1) = .{},
 
         pub fn init(source: []const u8, iterators: [N]EventIteratorT(HighlightEventT(Highlight))) Self {
             var states: [N]IterState = undefined;
 
-            inline for (iterators,0..N) |iterator, i| {
-                states[i] = IterState{.iterator = iterator};
+            inline for (iterators, 0..N) |iterator, i| {
+                states[i] = IterState{ .iterator = iterator };
             }
             return Self{
                 .states = states,
@@ -462,28 +478,67 @@ pub fn IteratorCombinatorSum(Highlight: type, N: comptime_int) type {
             return evt;
         }
 
-        fn emitHighlight(self: *Self, highlight: Highlight, end: u64) ?HighlightEventT(Highlight) {
-            assert(self.first_event == null);
-            assert(self.second_event == null);
-            self.first_event = .{ .Source = .{ .start = self.cur_ix, .end = end } };
-            self.second_event = .{ .HighlightEnd = {} };
-            return self.emitEvent(.{ .HighlightStart = highlight });
+        fn emitHighlights(self: *Self, highlights: std.EnumSet(Highlight), end: u64) ?HighlightEventT(Highlight) {
+            assert(self.deque.len == 0);
+
+            var highlight_iter = highlights.iterator();
+            while (highlight_iter.next()) |highlight| {
+                self.deque.enqueue(.{ .HighlightStart = highlight });
+            }
+
+            self.deque.enqueue(.{ .Source = .{ .start = self.cur_ix, .end = end } });
+
+            for (0..highlights.count()) |_| {
+                self.deque.enqueue(.{ .HighlightEnd = {} });
+            }
+
+            // Guaranteed to at least have a source event
+            return self.emitEvent(self.deque.dequeue().?);
         }
 
         pub fn next(self: *Self) !?HighlightEventT(Highlight) {
-            if (self.first_event) |evt| {
-                self.first_event = self.second_event;
-                self.second_event = null;
+            if (self.deque.dequeue()) |evt| {
                 return self.emitEvent(evt);
             }
 
+            if (self.cur_ix == self.source.len) {
+                return null;
+            }
+
             var min_start = self.source.len;
+            var min_end = self.source.len;
             for (&self.states) |*state| {
                 try state.updateRange(self.cur_ix);
                 if (state.cur_range) |range| {
                     min_start = @min(min_start, range.start);
+                    min_end = @min(min_end, range.end);
                 }
             }
+
+            for (self.states) |state| {
+                if (state.cur_range) |range| {
+                    std.debug.print("updated range: {any}\n", .{range});
+                    if (range.start > min_start) {
+                        min_end = @min(min_end, range.start);
+                    }
+                }
+            }
+
+            assert(min_end > min_start);
+
+            var open_highlights: std.EnumSet(Highlight) = .initEmpty();
+
+            for (self.states) |state| {
+                if (state.cur_range) |range| {
+                    if (range.asRange().contains(self.cur_ix)) {
+                        open_highlights.insert(range.highlight);
+                    }
+                }
+            }
+
+            std.debug.print("found end: {d}\n", .{min_end});
+
+            return self.emitHighlights(open_highlights, min_end);
         }
     };
 }
@@ -503,8 +558,8 @@ test "Simple sum" {
     };
 
     const iterator_ranges = [_]IteratorRange(util.TestHighlight){
-        .{.ranges = &a_ranges, .highlight = a_highlight },
-        .{.ranges = &b_ranges, .highlight = b_highlight },
+        .{ .ranges = &a_ranges, .highlight = a_highlight },
+        .{ .ranges = &b_ranges, .highlight = b_highlight },
     };
 
     const expected_events = [_]EventT{

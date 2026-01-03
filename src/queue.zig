@@ -6,6 +6,7 @@ fn QueueNodeT(Child: type) type {
         next: ?*QueueNodeT(Child),
     };
 }
+
 fn IteratorT(Child: type) type {
     return struct {
         cur: ?*QueueNodeT(Child),
@@ -20,9 +21,30 @@ fn IteratorT(Child: type) type {
     };
 }
 
-pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) type {
+pub fn RingBufferDeque(comptime Child: type, buffer_size: comptime_int) type {
     return struct {
         const Self = @This();
+
+        const DequeIter = struct {
+            num_returned: usize,
+            deque: *Self,
+
+            fn init(deque: *Self) @This() {
+                return @This(){
+                    .num_returned = 0,
+                    .deque = deque,
+                };
+            }
+
+            pub fn next(self: *@This()) ?Child {
+                if (self.num_returned == self.deque.len) {
+                    return null;
+                }
+                const next_ix = (self.deque.start + self.num_returned) % buffer_size;
+                self.num_returned += 1;
+                return self.deque.buffer[next_ix];
+            }
+        };
 
         buffer: [buffer_size]?Child = undefined,
         start: usize = 0,
@@ -49,8 +71,19 @@ pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) ty
             if (self.len == 0) {
                 return null;
             }
-            const last_ix = (self.start + self.len - 1) % buffer_size;
+            const first_ix = self.start;
             self.start = (self.start + 1) % buffer_size;
+            self.len -= 1;
+            std.debug.assert(self.len >= 0);
+            std.debug.assert(self.len < buffer_size);
+            return self.buffer[first_ix];
+        }
+
+        pub fn removeRight(self: *Self) ?Child {
+            if (self.len == 0) {
+                return null;
+            }
+            const last_ix = (self.start + self.len - 1) % buffer_size;
             self.len -= 1;
             std.debug.assert(self.len >= 0);
             std.debug.assert(self.len < buffer_size);
@@ -58,7 +91,11 @@ pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) ty
         }
 
         pub fn pushLeft(self: *Self, value: Child) void {
-            self.start = (self.start - 1) % buffer_size;
+            if (self.start == 0) {
+                self.start = buffer_size - 1;
+            } else {
+                self.start = (self.start - 1);
+            }
             self.len += 1;
             self.buffer[self.start] = value;
             std.debug.assert(self.len > 0);
@@ -76,22 +113,45 @@ pub fn ComptimeBufferedQueue(comptime Child: type, buffer_size: comptime_int) ty
         }
 
         // Modifying the queue while iterating is undefined.
-        // pub fn iter(self: *Self) type {
-        //     return struct {
-        //         num_returned: usize,
-        //         queue: *Self,
-        //
-        //         pub fn next(self: *@This()) ?Child {
-        //             if (num_returned == self.queue.len) {
-        //                 return null;
-        //             }
-        //             const next_ix = (self.start + self.num_returned) % buffer_size;
-        //             self.num_returned += 1;
-        //             return self.queue.buffer[next_ix];
-        //         }
-        //     };
-        // }
+        pub fn iter(self: *Self) DequeIter {
+            return DequeIter.init(self);
+        }
     };
+}
+
+test "Ring buffer deque" {
+    var deque: RingBufferDeque(u64, 4) = .{};
+    deque.enqueue(7);
+    std.debug.assert(deque.len == 1);
+    std.debug.assert(deque.peek() == 7);
+    deque.pushLeft(6);
+    std.debug.assert(deque.len == 2);
+    std.debug.assert(deque.peek() == 6);
+    deque.enqueue(8);
+    std.debug.assert(deque.peek() == 6);
+    std.debug.assert(deque.len == 3);
+    deque.pushLeft(5);
+    std.debug.assert(deque.peek() == 5);
+    std.debug.assert(deque.len == 4);
+    std.debug.assert(deque.removeRight() == 8);
+    std.debug.assert(deque.peek() == 5);
+    std.debug.assert(deque.len == 3);
+    deque.enqueue(9);
+    std.debug.assert(deque.len == 4);
+    std.debug.assert(deque.peek() == 5);
+    std.debug.assert(deque.dequeue() == 5);
+    deque.pushLeft(4);
+    std.debug.assert(deque.peek() == 4);
+
+    var iter = deque.iter();
+    var i: usize = 0;
+    const expected = [_]u64{ 4, 6, 7, 9 };
+    while (iter.next()) |item| : (i += 1) {
+        std.debug.assert(item == expected[i]);
+    }
+
+    deque.clear(false);
+    std.debug.assert(deque.len == 0);
 }
 
 pub fn Queue(comptime Child: type) type {
