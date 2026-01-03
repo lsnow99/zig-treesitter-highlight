@@ -153,7 +153,22 @@ pub fn IteratorCombinatorOverride(Highlight: type) type {
     };
 }
 
-fn testIteratorCombinator(
+fn testIterator(
+    Highlight: type,
+    iterator: EventIteratorT(HighlightEventT(Highlight)),
+    expected_events: []const HighlightEventT(Highlight),
+) !void {
+    for (expected_events) |expected| {
+        const highlight_event = try iterator.next();
+        if (highlight_event) |actual| {
+            try std.testing.expectEqualDeep(expected, actual);
+        } else {
+            unreachable;
+        }
+    }
+}
+
+fn testIteratorOverride(
     Highlight: type,
     source: []const u8,
     a_highlight: Highlight,
@@ -171,14 +186,35 @@ fn testIteratorCombinator(
     var combo = IteratorCombinatorOverride(Highlight).init(source, a_static_highlighter.iter(), b_static_highlighter.iter());
     const combo_highlighter = combo.iter();
 
-    for (expected_events) |expected| {
-        const highlight_event = try combo_highlighter.next();
-        if (highlight_event) |actual| {
-            try std.testing.expectEqualDeep(expected, actual);
-        } else {
-            unreachable;
-        }
+    try testIterator(Highlight, combo_highlighter, expected_events);
+}
+
+fn IteratorRange(Highlight: type) type {
+    return struct {
+        ranges: []const HighlightRange,
+        highlight: Highlight,
+    };
+}
+
+fn testIteratorSum(
+    Highlight: type,
+    source: []const u8,
+    len: comptime_int,
+    iterator_ranges: [len]IteratorRange(Highlight),
+    expected_events: []const HighlightEventT(Highlight),
+) !void {
+    var iterators: [len]EventIteratorT(HighlightEventT(Highlight)) = undefined;
+
+    for (iterator_ranges,0..len) |iterator_range, i| {
+        var highlighter = StaticIterator(HighlightRange).init(iterator_range.ranges);
+        var iterator = StaticHighlighter(Highlight).init(source, highlighter.iter(), iterator_range.highlight);
+        iterators[i] = iterator.iter();
     }
+
+    var sum = IteratorCombinatorSum(Highlight, len).init(source, iterators);
+    const sum_iter = sum.iter();
+
+    try testIterator(Highlight, sum_iter, expected_events);
 }
 
 test "Basic Combination" {
@@ -198,7 +234,7 @@ test "Basic Combination" {
         EventT{ .Source = .{ .start = 7, .end = source.len } },
     };
 
-    try testIteratorCombinator(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
+    try testIteratorOverride(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
 }
 
 test "Back Overlapping Combination" {
@@ -221,7 +257,7 @@ test "Back Overlapping Combination" {
         EventT{ .Source = .{ .start = 8, .end = source.len } },
     };
 
-    try testIteratorCombinator(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
+    try testIteratorOverride(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
 }
 
 test "Front Overlapping Combination" {
@@ -244,7 +280,7 @@ test "Front Overlapping Combination" {
         EventT{ .Source = .{ .start = 8, .end = source.len } },
     };
 
-    try testIteratorCombinator(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
+    try testIteratorOverride(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
 }
 
 test "Only B Combination" {
@@ -264,7 +300,7 @@ test "Only B Combination" {
         EventT{ .Source = .{ .start = 7, .end = source.len } },
     };
 
-    try testIteratorCombinator(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
+    try testIteratorOverride(util.TestHighlight, source, a_highlight, b_highlight, &a_ranges, &b_ranges, &expected_events);
 }
 
 test "Hidden B Combination" {
@@ -293,7 +329,7 @@ test "Hidden B Combination" {
         EventT{ .Source = .{ .start = 10, .end = source.len } },
     };
 
-    try testIteratorCombinator(
+    try testIteratorOverride(
         util.TestHighlight,
         source,
         a_highlight,
@@ -332,7 +368,7 @@ test "Double Overlapping B Combination" {
         EventT{ .Source = .{ .start = 12, .end = source.len } },
     };
 
-    try testIteratorCombinator(
+    try testIteratorOverride(
         util.TestHighlight,
         source,
         a_highlight,
@@ -347,7 +383,7 @@ test "Double Overlapping B Combination" {
 // iter_a overlap highlighted regions from iter_b, the source will be highlighted based on the highlights from
 // iter_a. Iterators are assumed to never have more than one open HighlightEvent at a time. Resulting iterator will
 // have at most two HighlightEvents open at a given time.
-pub fn IteratorCombinatorSum(Highlight: type) type {
+pub fn IteratorCombinatorSum(Highlight: type, N: comptime_int) type {
     const IterT = EventIteratorT(HighlightEventT(Highlight));
 
     const IterState = struct {
@@ -392,26 +428,22 @@ pub fn IteratorCombinatorSum(Highlight: type) type {
         }
     };
 
-    _ = IterState;
-
     return struct {
         const Self = @This();
-        iterators: []const EventIteratorT(HighlightEventT(Highlight)),
+        states: [N]IterState,
         cur_ix: u64 = 0,
         first_event: ?HighlightEventT(Highlight) = null,
         second_event: ?HighlightEventT(Highlight) = null,
         source: []const u8,
 
-        pub fn init(source: []const u8, iterators: []const EventIteratorT(HighlightEventT(Highlight))) Self {
-            const info = @typeInfo(@TypeOf(iterators));
-            if (info != .Array) @compileError("Expected array type");
+        pub fn init(source: []const u8, iterators: [N]EventIteratorT(HighlightEventT(Highlight))) Self {
+            var states: [N]IterState = undefined;
 
-            inline for (iterators) |item| {
-                _ = item;
-                @compileLog("test");
+            inline for (iterators,0..N) |iterator, i| {
+                states[i] = IterState{.iterator = iterator};
             }
             return Self{
-                .iterators = iterators,
+                .states = states,
                 .source = source,
             };
         }
@@ -445,38 +477,12 @@ pub fn IteratorCombinatorSum(Highlight: type) type {
                 return self.emitEvent(evt);
             }
 
-            try self.a_state.updateRange(self.cur_ix);
-            try self.b_state.updateRange(self.cur_ix);
-
-            if (self.a_state.cur_range) |a_range| {
-                if (self.b_state.cur_range) |b_range| {
-                    const first = @min(a_range.start, b_range.start);
-                    if (self.cur_ix < first) {
-                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = first } });
-                    }
-                    if (b_range.start < a_range.start) {
-                        assert(b_range.start == self.cur_ix);
-                        return self.emitHighlight(b_range.highlight, @min(a_range.start, b_range.end));
-                    } else {
-                        assert(a_range.start == self.cur_ix);
-                        return self.emitHighlight(a_range.highlight, a_range.end);
-                    }
-                } else {
-                    if (self.cur_ix < a_range.start) {
-                        return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = a_range.start } });
-                    }
-                    assert(a_range.start == self.cur_ix);
-                    return self.emitHighlight(a_range.highlight, a_range.end);
+            var min_start = self.source.len;
+            for (&self.states) |*state| {
+                try state.updateRange(self.cur_ix);
+                if (state.cur_range) |range| {
+                    min_start = @min(min_start, range.start);
                 }
-            } else if (self.b_state.cur_range) |b_range| {
-                if (self.cur_ix < b_range.start) {
-                    return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = b_range.start } });
-                }
-                assert(b_range.start == self.cur_ix);
-                return self.emitHighlight(b_range.highlight, b_range.end);
-            } else {
-                // Flush to end
-                return self.emitEvent(.{ .Source = .{ .start = self.cur_ix, .end = self.source.len } });
             }
         }
     };
@@ -496,6 +502,11 @@ test "Simple sum" {
         .{ .start = 7, .end = 10 },
     };
 
+    const iterator_ranges = [_]IteratorRange(util.TestHighlight){
+        .{.ranges = &a_ranges, .highlight = a_highlight },
+        .{.ranges = &b_ranges, .highlight = b_highlight },
+    };
+
     const expected_events = [_]EventT{
         EventT{ .Source = .{ .start = 0, .end = 5 } },
         EventT{ .HighlightStart = a_highlight },
@@ -510,14 +521,11 @@ test "Simple sum" {
         EventT{ .Source = .{ .start = 12, .end = source.len } },
     };
 
-    try testIteratorCombinator(
+    try testIteratorSum(
         util.TestHighlight,
         source,
-        a_highlight,
-        b_highlight,
-        &a_ranges,
-        &b_ranges,
+        iterator_ranges.len,
+        iterator_ranges,
         &expected_events,
     );
 }
-
