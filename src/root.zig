@@ -4,10 +4,11 @@ const assert = std.debug.assert;
 const print = std.debug.print;
 const ts = @import("tree-sitter");
 const Queue = @import("queue.zig").Queue;
-const ComptimeBufferedQueue = @import("queue.zig").ComptimeBufferedQueue;
+const RingBufferDeque = @import("queue.zig").RingBufferDeque;
 const util = @import("util.zig");
 
-pub const IteratorCombinator = @import("combinator.zig").IteratorCombinator;
+pub const IteratorCombinatorOverride = @import("combinator.zig").IteratorCombinatorOverride;
+pub const IteratorCombinatorSum = @import("combinator.zig").IteratorCombinatorSum;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 
@@ -227,6 +228,10 @@ const HighlightTree = union(enum) {
 pub const HighlightRange = struct {
     start: usize,
     end: usize,
+
+    pub fn contains(self: @This(), point: usize) bool {
+        return point >= self.start and point < self.end;
+    }
 };
 
 pub fn HighlightEventT(HighlightT: type) type {
@@ -961,4 +966,8 @@ test "basic expand" {
 
 test "combinators" {
     _ = @import("combinator.zig");
+}
+
+test "queue" {
+    _ = @import("queue.zig");
 }
