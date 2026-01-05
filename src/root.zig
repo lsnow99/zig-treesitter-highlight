@@ -9,6 +9,7 @@ const util = @import("util.zig");
 
 pub const IteratorCombinatorOverride = @import("combinator.zig").IteratorCombinatorOverride;
 pub const IteratorCombinatorSum = @import("combinator.zig").IteratorCombinatorSum;
+pub const IteratorProgressor = @import("combinator.zig").IteratorProgressor;
 
 extern fn tree_sitter_python() callconv(.c) *ts.Language;
 

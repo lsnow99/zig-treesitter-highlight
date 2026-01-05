@@ -22,7 +22,7 @@ fn ValuedHighlightRange(Highlight: type) type {
     };
 }
 
-fn IteratorProgressor(Highlight: type) type {
+pub fn IteratorProgressor(Highlight: type) type {
     return struct {
         const Self = @This();
         iterator: EventIteratorT(HighlightEventT(Highlight)),
