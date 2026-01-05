@@ -172,7 +172,6 @@ pub fn renderTerminal(Highlight: type, source: []const u8, out: *std.io.Writer, 
     var delim_iter = HighlightDelimitedIterator(Highlight).init('\n', highlighter, source);
     defer delim_iter.destroy();
     while (try delim_iter.next()) |event| {
-        std.debug.print("evt: {any}\n", .{event});
         switch (event) {
             .Source => |range| {
                 try out.print("{s}", .{source[range.start..range.end]});
@@ -190,7 +189,6 @@ pub fn renderTerminal(Highlight: type, source: []const u8, out: *std.io.Writer, 
         }
     }
     try out.flush();
-    std.debug.print("srclen: {d}\n", .{source.len});
 }
 
 pub fn renderHTMLLines(source: []const u8, out: *std.io.Writer, highlighter: anytype, class_map: std.EnumMap(@TypeOf(highlighter).InternalHighlightT, []const u8), opts: RendererOpts) !void {
