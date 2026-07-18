@@ -4,9 +4,9 @@ const assert = std.debug.assert;
 const print = std.debug.print;
 const ts = @import("tree-sitter");
 const Queue = @import("queue.zig").Queue;
-const RingBufferDeque = @import("queue.zig").RingBufferDeque;
 const util = @import("util.zig");
 
+pub const RingBufferDeque = @import("queue.zig").RingBufferDeque;
 pub const IteratorCombinatorOverride = @import("combinator.zig").IteratorCombinatorOverride;
 pub const IteratorCombinatorSum = @import("combinator.zig").IteratorCombinatorSum;
 pub const IteratorProgressor = @import("combinator.zig").IteratorProgressor;
@@ -783,7 +783,7 @@ pub fn splitComptime(comptime name: []const u8, comptime char: u8) [countChars(s
 }
 
 pub fn expand(allocator: std.mem.Allocator, name: []const u8) ![][]const u8 {
-    var result: std.ArrayList([]const u8) = .{};
+    var result: std.ArrayList([]const u8) = .empty;
     defer result.deinit(allocator);
     var parts = std.mem.splitScalar(u8, name, '.');
     while (parts.next()) |part| {
@@ -797,7 +797,7 @@ pub fn collectNames(allocator: std.mem.Allocator, language: *ts.Language, query_
     const query = try ts.Query.create(language, query_raw, &error_offset);
     const capture_count = query.captureCount();
 
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(allocator);
 
     for (0..capture_count) |capture_index| {
@@ -863,23 +863,15 @@ pub fn matchName(comptime T: type, captured_name: []const u8) ?T {
 }
 
 pub fn createEnum(comptime highlight_names: []const []const u8) type {
-    var fields: [highlight_names.len]std.builtin.Type.EnumField = undefined;
+    var field_names: [highlight_names.len][]const u8 = undefined;
+    var field_values: [highlight_names.len]u32 = undefined;
 
     for (highlight_names, 0..) |name, i| {
-        fields[i] = .{
-            .name = name ++ [1:0]u8{0},
-            .value = i,
-        };
+        field_names[i] = name ++ [1:0]u8{0};
+        field_values[i] = i;
     }
 
-    return @Type(.{
-        .@"enum" = .{
-            .tag_type = u32,
-            .fields = &fields,
-            .decls = &.{},
-            .is_exhaustive = true,
-        },
-    });
+    return @Enum(u32, .exhaustive, &field_names, &field_values);
 }
 
 pub fn getFirstValue(comptime EnumType: type) EnumType {
@@ -893,24 +885,17 @@ test "createEnum" {
     };
 
     const HighlightEnum = createEnum(highlight_names);
-    const value: HighlightEnum = .@"punctuation.special";
 
     switch (getFirstValue(HighlightEnum)) {
         .keyword => {},
         .@"punctuation.special" => {},
     }
 
-    std.debug.print("Enum value = {}\n", .{@intFromEnum(value)});
-
     const res = matchName(HighlightEnum, "keyword");
     if (res) |r| {
         switch (r) {
-            .keyword => {
-                std.debug.print("Matched keyword\n", .{});
-            },
-            .@"punctuation.special" => {
-                std.debug.print("matched punctuation", .{});
-            },
+            .keyword => {},
+            else => unreachable,
         }
     }
 }

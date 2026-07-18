@@ -5,19 +5,20 @@ fn buildGrammar(b: *std.Build, mod: *std.Build.Module, target: std.Build.Resolve
     switch (grammar_cfg) {
         .C => |c_cfg| {
             const grammar_dep = b.dependency(c_cfg.dep_name, .{});
+            const grammar_mod = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+            });
             const grammar_lib = b.addLibrary(.{
                 .name = c_cfg.mod_name,
-                .root_module = b.createModule(.{
-                    .target = target,
-                    .optimize = optimize,
-                }),
+                .root_module = grammar_mod,
             });
-            grammar_lib.addCSourceFiles(.{
+            grammar_mod.addCSourceFiles(.{
                 .root = grammar_dep.path(c_cfg.src_dir),
                 .files = c_cfg.src_files,
                 .flags = c_cfg.flags orelse &.{},
             });
-            grammar_lib.linkLibC();
+            grammar_mod.link_libc = true;
             mod.linkLibrary(grammar_lib);
         },
         .CPP => {

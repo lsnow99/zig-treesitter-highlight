@@ -18,7 +18,7 @@
     .fingerprint = 0x3ca70040bccb5d1b,
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -55,8 +55,8 @@
         //    .lazy = false,
         //},
         .tree_sitter = .{
-            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#4c5d3a45a9828b8fddd3d59132c4346182fc23b7",
-            .hash = "tree_sitter-0.25.0-8heIf4KZAQCmEhQwLPPtKBsU3BBkohvUJpfDXc7vmDM7",
+            .url = "git+https://github.com/tree-sitter/zig-tree-sitter#b562510b5563dcf3b7fcac4a5fe9d60834c84667",
+            .hash = "tree_sitter-0.26.0-8heIf-vDAQDh0HhAAUVwVZFmLrwSKMZl5gRaVFqtas0W",
         },
         .tree_sitter_python = .{
             .url = "git+https://github.com/tree-sitter/tree-sitter-python#293fdc02038ee2bf0e2e206711b69c90ac0d413f",
